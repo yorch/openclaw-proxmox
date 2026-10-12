@@ -323,6 +323,7 @@ GITHUB_KEY_FPS=()           # "TYPE BITS SHA256:..." per imported key
 fetch_github_keys() {
     local user="$1" out="$2" raw one line fp_out bits fp ktype http="" rc=0 size n=0 skipped=0
     local key_re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+([A-Za-z0-9+/]+={0,3})([[:space:]].*)?$'
+    local -A seen=()
     GITHUB_KEY_FPS=()
     if ! [[ "$user" =~ ^[A-Za-z0-9]([A-Za-z0-9]|-[A-Za-z0-9])*$ ]] || (( ${#user} > 39 )); then
         err "'$user' is not a valid GitHub username (letters, digits and single inner hyphens, at most 39)."
@@ -334,7 +335,9 @@ fetch_github_keys() {
     one="${out}.one"
     rm -f "$out" "$raw" "$one"
     http=$(curl -fsS --proto =https --tlsv1.2 --max-time 20 --max-filesize "$GITHUB_KEYS_MAX_BYTES" \
-        -o "$raw" -w '%{http_code}' "https://github.com/${user}.keys" 2>/dev/null) || rc=$?
+        -o "$raw" -w '%{http_code}' "https://github.com/${user}.keys") || rc=$?
+    # NOTE: before curl 8.4 (Proxmox VE 8 ships 7.88) --max-filesize is only enforced when the
+    # server announces a size, so the byte count is re-checked below; --max-time bounds the rest.
     if (( rc != 0 )); then
         if [[ "$http" == "404" ]]; then
             err "GitHub user '$user' was not found."
@@ -347,6 +350,11 @@ fetch_github_keys() {
         else
             err "Could not download https://github.com/${user}.keys (curl exit code $rc; network, DNS or TLS problem)."
         fi
+        rm -f "$raw"
+        return 1
+    fi
+    if [[ "$http" != "200" ]]; then
+        err "GitHub answered HTTP ${http:-?} (not 200) for https://github.com/${user}.keys."
         rm -f "$raw"
         return 1
     fi
@@ -364,6 +372,9 @@ fetch_github_keys() {
             skipped=$((skipped + 1))
             continue
         fi
+        # The same key can be listed more than once; keep it once
+        [[ -z "${seen[${BASH_REMATCH[2]}]:-}" ]] || continue
+        seen[${BASH_REMATCH[2]}]=1
         printf '%s %s github:%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$user" > "$one"
         if ! fp_out=$(ssh-keygen -l -E sha256 -f "$one" 2>/dev/null); then
             skipped=$((skipped + 1))
@@ -401,9 +412,9 @@ if [[ -n "$GITHUB_SSH_USER" ]]; then
     fetch_github_keys "$GITHUB_SSH_USER" "$WORKDIR/authorized_keys.github" \
         || fatal "Could not import SSH keys for GitHub user '$GITHUB_SSH_USER' (unset GITHUB_SSH_USER to install without keys)."
     GITHUB_KEYS_FILE="$WORKDIR/authorized_keys.github"
-elif [[ -t 0 ]]; then
+elif [[ -t 0 && "$ASSUME_YES" != "1" ]]; then
     while true; do
-        read -rp "GitHub username to import SSH keys from (blank to skip): " GITHUB_SSH_USER
+        read -rp "GitHub username to import SSH keys from (blank to skip): " GITHUB_SSH_USER || GITHUB_SSH_USER=""
         [[ -n "$GITHUB_SSH_USER" ]] || break
         if fetch_github_keys "$GITHUB_SSH_USER" "$WORKDIR/authorized_keys.github"; then
             GITHUB_KEYS_FILE="$WORKDIR/authorized_keys.github"
@@ -414,8 +425,8 @@ elif [[ -t 0 ]]; then
 fi
 if [[ -n "$GITHUB_KEYS_FILE" ]]; then
     ok "Fetched ${#GITHUB_KEY_FPS[@]} SSH key(s) of github.com/${GITHUB_SSH_USER} (fingerprints are shown in the plan)."
-    if [[ -z "${SSH_DISABLE_PASSWORD:-}" && -t 0 ]]; then
-        read -rp "Disable SSH password login (keys only)? [y/N]: " SSH_DISABLE_PASSWORD_ANSWER
+    if [[ -z "${SSH_DISABLE_PASSWORD:-}" && -t 0 && "$ASSUME_YES" != "1" ]]; then
+        read -rp "Disable SSH password login (keys only)? [y/N]: " SSH_DISABLE_PASSWORD_ANSWER || SSH_DISABLE_PASSWORD_ANSWER=""
         if [[ "$SSH_DISABLE_PASSWORD_ANSWER" =~ ^[Yy] ]]; then SSH_DISABLE_PASSWORD=1; else SSH_DISABLE_PASSWORD=0; fi
     fi
 fi
@@ -774,7 +785,9 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 SSHD
         /usr/sbin/sshd -t
-        systemctl reload ssh
+        # Never abort the install over this: the host's verification reports the real state
+        systemctl try-reload-or-restart ssh.service || systemctl restart ssh.service \
+            || echo "WARNING: could not reload sshd; password login may still be enabled" >&2
     fi
 elif [[ "$SSH_DISABLE_PASSWORD" == "1" ]]; then
     echo "WARNING: no SSH keys were installed, so SSH password login stays enabled" >&2
@@ -1285,6 +1298,7 @@ if [[ -n "$GITHUB_KEYS_FILE" ]]; then
     check "SSH keys from GitHub authorized for ${CT_USER}" "test -s /home/${CT_USER}/.ssh/authorized_keys"
     if [[ "$SSH_DISABLE_PASSWORD" == "1" ]]; then
         check "SSH password login disabled" "/usr/sbin/sshd -T | grep -qx 'passwordauthentication no'"
+        SSH_PW_DISABLED_OK=$CHECK_OK
     fi
 fi
 GATEWAY_RESTARTS=$(ct_exec "systemctl show -p NRestarts --value openclaw-gateway" 2>/dev/null || echo 0)
@@ -1325,6 +1339,7 @@ else
     TUNNEL_NOTE="first run: ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 ${CT_USER}@${CT_IP}"
 fi
 
+SSH_PW_DISABLED_OK="${SSH_PW_DISABLED_OK:-0}"
 TAILNET_UP=0
 TS_DASH_OK="${TS_DASH_OK:-0}"
 [[ "$TS_STATE" == "up" && -n "$TS_DNS" ]] && TAILNET_UP=1
@@ -1346,7 +1361,14 @@ summary() {
     kv "Container" "$VMID ($CT_HOSTNAME) · $CT_IP"
     kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (no sudo; root shell: pct enter $VMID)"
     if [[ -n "$GITHUB_KEYS_FILE" ]]; then
-        kv "" "${DIM}key login with your github.com/${GITHUB_SSH_USER} key(s) (${#GITHUB_KEY_FPS[@]}); password login $([[ "$SSH_DISABLE_PASSWORD" == "1" ]] && echo disabled || echo "also enabled")${NC}"
+        if [[ "$SSH_DISABLE_PASSWORD" != "1" ]]; then
+            kv "" "${DIM}key login with your github.com/${GITHUB_SSH_USER} key(s) (${#GITHUB_KEY_FPS[@]}); password login also enabled${NC}"
+        elif (( SSH_PW_DISABLED_OK )); then
+            kv "" "${DIM}key login only (github.com/${GITHUB_SSH_USER}, ${#GITHUB_KEY_FPS[@]} key(s)); password login disabled${NC}"
+            kv "" "${DIM}locked out? pct enter ${VMID}, remove /etc/ssh/sshd_config.d/10-openclaw.conf, systemctl reload ssh${NC}"
+        else
+            kv "" "${YELLOW}password login could NOT be confirmed as disabled — check sshd in the container${NC}"
+        fi
     fi
     echo
     if (( TAILNET_UP )); then

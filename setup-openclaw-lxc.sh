@@ -6,6 +6,11 @@
 # It creates a Debian 13 LXC, installs OpenClaw + LXQt desktop + Google Chrome + VNC/noVNC,
 # and prints connection info when done.
 #
+# Every setting can be preset through the environment for unattended runs, e.g.:
+#   CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 CORES=6 ./setup-openclaw-lxc.sh
+# Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME BRIDGE
+#            TMPL_STORAGE ROOT_STORAGE ONBOOT
+#
 
 set -euo pipefail
 
@@ -23,94 +28,146 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 fatal() { err "$@"; exit 1; }
 
+# ─── Cleanup on failure ──────────────────────────────────────────────────────
+VMID="${VMID:-}"
+CT_CREATED=0
+
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    if (( rc != 0 && CT_CREATED )); then
+        err "Setup failed. Container $VMID was left in place for inspection."
+        err "  Inspect:  pct enter $VMID"
+        err "  Remove:   pct stop $VMID; pct destroy $VMID --purge"
+        if [[ -t 0 && -t 1 ]]; then
+            local answer=""
+            read -rp "Destroy container $VMID now? [y/N]: " answer || true
+            if [[ "$answer" =~ ^[Yy]$ ]]; then
+                pct stop "$VMID" >/dev/null 2>&1 || true
+                pct destroy "$VMID" --purge >/dev/null 2>&1 \
+                    && info "Container $VMID destroyed." \
+                    || err "Could not destroy container $VMID."
+            fi
+        fi
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
 # ─── Pre-flight checks ───────────────────────────────────────────────────────
 command -v pct  >/dev/null 2>&1 || fatal "pct not found — this script must run on a Proxmox host."
 command -v pvesh >/dev/null 2>&1 || fatal "pvesh not found — this script must run on a Proxmox host."
 command -v pveam >/dev/null 2>&1 || fatal "pveam not found — this script must run on a Proxmox host."
+command -v python3 >/dev/null 2>&1 || fatal "python3 not found (needed to parse Proxmox API output)."
+command -v openssl >/dev/null 2>&1 || fatal "openssl not found."
 [[ $(id -u) -eq 0 ]] || fatal "This script must be run as root."
+[[ "$(dpkg --print-architecture)" == "amd64" ]] \
+    || fatal "Only amd64 hosts are supported (Google Chrome is installed from the amd64 .deb)."
 
-# ─── User prompts ────────────────────────────────────────────────────────────
+# ─── Settings (environment first, then prompts) ──────────────────────────────
+# ask VAR "Prompt" DEFAULT — keep a preset value, else prompt on a TTY, else use the default.
+ask() {
+    local var="$1" prompt="$2" default="$3" reply=""
+    [[ -z "${!var:-}" ]] || return 0
+    if [[ -t 0 ]]; then
+        read -rp "$prompt [$default]: " reply
+    fi
+    printf -v "$var" '%s' "${reply:-$default}"
+}
+
+require_int() { # require_int NAME MIN MAX
+    local name="$1" min="$2" max="$3" value="${!1}"
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= min && value <= max )) \
+        || fatal "$name must be a whole number between $min and $max (got '$value')."
+}
+
 echo -e "${BOLD}╔═══════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}║     OpenClaw LXC Setup for Proxmox               ║${NC}"
 echo -e "${BOLD}╚═══════════════════════════════════════════════════╝${NC}"
 echo
 
-read -rp "Container password: " -s CT_PASSWORD
-echo
+if [[ -z "${CT_PASSWORD:-}" ]]; then
+    [[ -t 0 ]] || fatal "No terminal available — set CT_PASSWORD in the environment."
+    read -rp "Container password: " -s CT_PASSWORD
+    echo
+    read -rp "Confirm password: " -s CT_PASSWORD_CONFIRM
+    echo
+    [[ "$CT_PASSWORD" == "$CT_PASSWORD_CONFIRM" ]] || fatal "Passwords do not match."
+fi
 [[ -n "$CT_PASSWORD" ]] || fatal "Password cannot be empty."
+[[ "$CT_PASSWORD" != *$'\n'* ]] || fatal "Password cannot contain newlines."
 
-read -rp "Disk size in GB [32]: " DISK_SIZE
-DISK_SIZE="${DISK_SIZE:-32}"
+ask DISK_SIZE "Disk size in GB"  32
+ask MEMORY    "Memory in MB"     4096
+ask CORES     "CPU cores"        4
+ask VNC_RES   "VNC resolution"   1920x1080
+CT_HOSTNAME="${CT_HOSTNAME:-openclaw}"
+BRIDGE="${BRIDGE:-vmbr0}"
+ONBOOT="${ONBOOT:-1}"
 
-read -rp "Memory in MB [4096]: " MEMORY
-MEMORY="${MEMORY:-4096}"
-
-read -rp "CPU cores [4]: " CORES
-CORES="${CORES:-4}"
-
-read -rp "VNC resolution [1920x1080]: " VNC_RES
-VNC_RES="${VNC_RES:-1920x1080}"
+require_int DISK_SIZE 4 100000
+require_int MEMORY 1024 1000000
+require_int CORES 1 512
+[[ "$VNC_RES" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || fatal "VNC resolution must look like 1920x1080 (got '$VNC_RES')."
+[[ "$CT_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fatal "Invalid hostname '$CT_HOSTNAME'."
+[[ "$BRIDGE" =~ ^[a-zA-Z0-9_.-]+$ ]] || fatal "Invalid bridge name '$BRIDGE'."
+[[ "$ONBOOT" =~ ^[01]$ ]] || fatal "ONBOOT must be 0 or 1."
+ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist on this host."
 
 echo
 
 # ─── Auto-detect next VMID ───────────────────────────────────────────────────
-info "Detecting next available VMID..."
-VMID=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
-  | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-ids = [r["vmid"] for r in data if "vmid" in r]
-print(max(ids) + 1 if ids else 100)
-' 2>/dev/null || echo 100)
+info "Selecting VMID..."
+if [[ -z "$VMID" ]]; then
+    VMID=$(pvesh get /cluster/nextid 2>/dev/null) || fatal "Could not get the next free VMID from the cluster."
+fi
+[[ "$VMID" =~ ^[0-9]+$ ]] || fatal "Invalid VMID '$VMID'."
+pvesh get /cluster/nextid --vmid "$VMID" >/dev/null 2>&1 || fatal "VMID $VMID is already in use."
 ok "Will use VMID: $VMID"
 
 # ─── Auto-detect storage ─────────────────────────────────────────────────────
 info "Detecting storage..."
+NODE=$(hostname -s)
 
-# Find template storage (supports vztmpl content)
-TMPL_STORAGE=$(pvesh get /storage --output-format json 2>/dev/null \
-  | python3 -c '
+# Enabled storages on this node that can hold the given content type (JSON)
+node_storage() {
+    pvesh get "/nodes/$NODE/storage" --content "$1" --enabled 1 --output-format json 2>/dev/null
+}
+
+# Template storage: prefer "local", else the first one that accepts vztmpl
+TMPL_STORAGE="${TMPL_STORAGE:-$(node_storage vztmpl | python3 -c '
+import json, sys
+names = [s["storage"] for s in json.load(sys.stdin)]
+print("local" if "local" in names else (names[0] if names else ""))
+' 2>/dev/null || true)}"
+[[ -n "$TMPL_STORAGE" ]] || fatal "No enabled storage on node '$NODE' accepts container templates (vztmpl)."
+
+# Rootfs storage: prefer local-lvm, else the rootdir storage with the most free space
+ROOT_STORAGE="${ROOT_STORAGE:-$(node_storage rootdir | python3 -c '
 import json, sys
 stores = json.load(sys.stdin)
-for s in stores:
-    content = s.get("content", "")
-    if "vztmpl" in content:
-        print(s["storage"])
-        break
-' 2>/dev/null || echo "local")
-
-# Find rootdir storage (prefer local-lvm, then any with rootdir)
-ROOT_STORAGE=$(pvesh get /storage --output-format json 2>/dev/null \
-  | python3 -c '
-import json, sys
-stores = json.load(sys.stdin)
-candidates = []
-for s in stores:
-    content = s.get("content", "")
-    if "rootdir" in content or "images" in content:
-        candidates.append(s["storage"])
-if "local-lvm" in candidates:
+names = [s["storage"] for s in stores]
+if "local-lvm" in names:
     print("local-lvm")
-elif candidates:
-    print(candidates[0])
-else:
-    print("local-lvm")
-' 2>/dev/null || echo "local-lvm")
+elif stores:
+    print(max(stores, key=lambda s: s.get("avail", 0))["storage"])
+' 2>/dev/null || true)}"
+[[ -n "$ROOT_STORAGE" ]] || fatal "No enabled storage on node '$NODE' accepts container root disks (rootdir)."
 
 ok "Template storage: $TMPL_STORAGE"
 ok "Rootfs storage:   $ROOT_STORAGE"
 
 # ─── Download Debian 13 template ─────────────────────────────────────────────
 info "Checking for Debian 13 template..."
-pveam update >/dev/null 2>&1 || true
+pveam update >/dev/null 2>&1 || warn "pveam update failed — using the cached template index."
 
-TEMPLATE=$(pveam available --section system 2>/dev/null | grep -oP 'debian-13-standard_\S+' | head -1 || true)
-if [[ -z "$TEMPLATE" ]]; then
-    TEMPLATE=$(pveam available 2>/dev/null | grep -oP 'debian-13-standard_\S+' | head -1 || true)
-fi
-[[ -n "$TEMPLATE" ]] || fatal "Could not find Debian 13 template. Check 'pveam available'."
+# Newest Debian 13 template in the index (version sort, not index order)
+TEMPLATE=$(pveam available --section system 2>/dev/null | grep -oP 'debian-13-standard_\S+' | sort -V | tail -n 1 || true)
+[[ -n "$TEMPLATE" ]] || fatal "Could not find a Debian 13 template. Check 'pveam available'."
 
-if pveam list "$TMPL_STORAGE" 2>/dev/null | grep -q "$TEMPLATE"; then
+TEMPLATE_LIST=$(pveam list "$TMPL_STORAGE" 2>/dev/null || true)
+if [[ "$TEMPLATE_LIST" == *"$TEMPLATE"* ]]; then
     ok "Template already downloaded: $TEMPLATE"
 else
     info "Downloading $TEMPLATE to $TMPL_STORAGE..."
@@ -121,41 +178,54 @@ fi
 # ─── Create the LXC container ────────────────────────────────────────────────
 info "Creating LXC container $VMID..."
 pct create "$VMID" "${TMPL_STORAGE}:vztmpl/${TEMPLATE}" \
-    --hostname openclaw \
+    --hostname "$CT_HOSTNAME" \
     --password "$CT_PASSWORD" \
     --rootfs "${ROOT_STORAGE}:${DISK_SIZE}" \
     --memory "$MEMORY" \
     --cores "$CORES" \
-    --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
     --unprivileged 0 \
+    --onboot "$ONBOOT" \
     --start 0
+CT_CREATED=1
 ok "Container $VMID created."
 
 info "Starting container $VMID..."
 pct start "$VMID"
 ok "Container started."
 
-info "Waiting for container to boot..."
-sleep 3
-
 # Helper: run a command inside the container
 ct_exec() {
     pct exec "$VMID" -- bash -c "$1"
 }
 
+info "Waiting for container to boot..."
+for _ in $(seq 1 30); do
+    ct_exec "true" >/dev/null 2>&1 && break
+    sleep 1
+done
+ct_exec "true" >/dev/null 2>&1 || fatal "Container did not become reachable."
+
 # ─── Wait for network ────────────────────────────────────────────────────────
-info "Waiting for DHCP lease (up to 30s)..."
+info "Waiting for DHCP lease (up to 60s)..."
 CT_IP=""
-for i in $(seq 1 30); do
+for _ in $(seq 1 60); do
     CT_IP=$(ct_exec "hostname -I 2>/dev/null" | awk '{print $1}' || true)
-    if [[ -n "$CT_IP" && "$CT_IP" != "127.0.0.1" ]]; then
-        break
-    fi
+    [[ -n "$CT_IP" && "$CT_IP" != "127.0.0.1" ]] && break
     CT_IP=""
     sleep 1
 done
-[[ -n "$CT_IP" ]] || warn "Could not detect container IP — continuing anyway."
-ok "Container IP: ${CT_IP:-unknown}"
+[[ -n "$CT_IP" ]] || fatal "Container got no IP address. Check that bridge '$BRIDGE' has a DHCP server."
+ok "Container IP: $CT_IP"
+
+info "Checking DNS and internet access from the container..."
+for _ in $(seq 1 30); do
+    ct_exec "getent hosts deb.debian.org >/dev/null" 2>/dev/null && break
+    sleep 1
+done
+ct_exec "getent hosts deb.debian.org >/dev/null" 2>/dev/null \
+    || fatal "Container cannot resolve deb.debian.org — check DNS and the network configuration."
+ok "Container has network access."
 
 # ─── Install packages inside the container ────────────────────────────────────
 info "Updating packages and installing prerequisites..."

@@ -39,6 +39,8 @@ Key helpers: `ct_exec()` wraps `pct exec $VMID -- bash -c` for small host-driven
 
 ## Repository
 
+The README is the project's front page: keep its tables (env vars, security model) in sync with the script. `assets/banner.svg` is the hand-written header image.
+
 GitHub: `yorch/openclaw-proxmox` (a fork of `adadrag/Openclaw-Proxmox`). Keep README install URLs pointing at this repo. Commit messages follow Conventional Commits.
 
 ## Testing Changes

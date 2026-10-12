@@ -1,207 +1,324 @@
-# OpenClaw on Proxmox — One Script, Full AI Assistant
+<div align="center">
+
+<img src="assets/banner.svg" alt="OpenClaw on Proxmox — one script, a private AI assistant with its own desktop" width="100%">
+
+<br>
 
 [![lint](https://github.com/yorch/openclaw-proxmox/actions/workflows/lint.yml/badge.svg)](https://github.com/yorch/openclaw-proxmox/actions/workflows/lint.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Proxmox VE](https://img.shields.io/badge/Proxmox%20VE-8%20%7C%209-e57000?logo=proxmox&logoColor=white)
+![Debian 13](https://img.shields.io/badge/Debian-13%20(trixie)-a81d33?logo=debian&logoColor=white)
+![Shell](https://img.shields.io/badge/made%20with-bash-4eaa25?logo=gnubash&logoColor=white)
 
-Deploy your own **[OpenClaw](https://openclaw.ai/) AI assistant** on any Proxmox server in minutes. One command, zero manual setup.
+**[Quick start](#-quick-start)** ·
+**[How it works](#-how-it-works)** ·
+**[Configuration](#-configuration)** ·
+**[Security](#-security-model)** ·
+**[Operations](#-day-2-operations)** ·
+**[Troubleshooting](#-troubleshooting)**
 
-## Why use this?
+</div>
 
-- **Self-hosted AI assistant** — OpenClaw runs entirely on your hardware, under your control
-- **One command to deploy** — no manual package installation, no config file editing, no guesswork
-- **Full remote desktop** — access a graphical LXQt desktop from any browser via noVNC
-- **Ready-to-use browser** — Google Chrome (sandboxed) as the default browser, ready for the OpenClaw browser extension
-- **Lightweight, contained** — runs in an unprivileged LXC (not a full VM) as a regular user, so it's fast, resource-efficient and isolated from the host
-- **Secure by default** — services listen on loopback only; opt in to LAN access with HTTPS for the desktop
-- **Auto-starts on boot** — the container and all services (gateway, VNC, noVNC) start with the host
-- **Onboarding made easy** — desktop shortcut walks you through OpenClaw setup step by step
-- **Homebrew included** — install OpenClaw skills right away
+---
 
-## Quick Start
+Run one command on your Proxmox host and get a ready-to-use **[OpenClaw](https://openclaw.ai/) AI assistant** living in its own container, with a full Linux desktop you can open from any browser. No packages to chase, no config files to edit.
 
-SSH into your Proxmox host and run:
+|  |  |
+|---|---|
+| 🧱 **Contained** | Unprivileged LXC, everything runs as a regular user — never as root |
+| 🔒 **Private by default** | Nothing is exposed to the network except SSH; opt in to an HTTPS desktop on your LAN |
+| 🖥️ **A desktop for your agent** | LXQt + Google Chrome + noVNC, so the assistant has a real browser and you can watch it work |
+| ⚙️ **Configurable** | Pick VMID, storage, bridge, static IP, VLAN, resources — interactively or from environment variables |
+| 🛡️ **Fails loudly** | Strict error handling inside and outside the container; a failed run offers to clean up after itself |
+| ♻️ **Survives reboots** | Container and services start with the host |
+
+## 🚀 Quick start
+
+On your **Proxmox host**, as root:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/yorch/openclaw-proxmox/main/setup-openclaw-lxc.sh)
 ```
 
-That's it. The script asks for a password, the container ID (VMID), the storage for the disk and a few sizing options (every prompt has a sensible default), shows a summary of the plan for you to confirm, then prints your connection details when done. A private copy of those details is saved to `/root/openclaw-lxc-<VMID>.txt` on the Proxmox host (readable by root only).
+You'll be asked for a password and a handful of options (all have sensible defaults), shown a plan, and asked to confirm before anything is created.
 
-Prefer to read it first? It's one file — download it (see below) and review it before running.
+<details>
+<summary><b>Prefer to read the script first?</b></summary>
 
-Options: `-y` / `--yes` skips the confirmation, `-h` / `--help` shows usage, and `NO_COLOR=1` disables colors. The install runs in six numbered stages, so you can see where it is.
+It is a single file. Download it, review it, then run it:
 
-### Alternative install methods
-
-**Download first, then run:**
-```bash
-wget -O setup-openclaw-lxc.sh https://raw.githubusercontent.com/yorch/openclaw-proxmox/main/setup-openclaw-lxc.sh
-chmod +x setup-openclaw-lxc.sh
-./setup-openclaw-lxc.sh
-```
-
-**Clone the repo:**
 ```bash
 git clone https://github.com/yorch/openclaw-proxmox.git
 cd openclaw-proxmox
-chmod +x setup-openclaw-lxc.sh
+less setup-openclaw-lxc.sh
 ./setup-openclaw-lxc.sh
 ```
 
-## What you get
+</details>
 
-After the script finishes, you'll have a fully configured LXC container. By default the dashboard and the remote desktop listen on the container's **loopback only**. Reach them through an SSH tunnel from your computer:
+<details>
+<summary><b>Unattended install</b></summary>
+
+Every prompt can be preset with an environment variable, and `--yes` skips the confirmation:
+
+```bash
+CT_PASSWORD='change-me' DISK_SIZE=64 MEMORY=8192 \
+IP_ADDRESS=10.20.0.50/24 GATEWAY=10.20.0.1 VLAN_TAG=20 \
+./setup-openclaw-lxc.sh --yes
+```
+
+See [Configuration](#-configuration) for the full list.
+
+</details>
+
+**What you need:** Proxmox VE 9 (8.x may work, see below) on an **amd64** host, root access, and internet access. Debian 13 containers need a recent `pve-container` (6.0.10 or newer has been reported to work, and support on PVE 8 is unconfirmed); run `apt full-upgrade` on the host if `pct create` rejects the template.
+
+## 🧭 How it works
+
+The installer runs in six numbered stages and is safe to read top to bottom:
+
+```text
+ [1/6] Checking the host and collecting settings
+ [2/6] Selecting storage and template        ← shows the plan, asks to confirm
+ [3/6] Creating the container
+ [4/6] Waiting for the network
+ [5/6] Provisioning the container            ← one strict script, [1/14] … [14/14]
+ [6/6] Verifying services
+```
+
+What ends up running inside the container:
+
+```mermaid
+flowchart LR
+    you(["You<br/>browser or SSH"])
+
+    subgraph lxc ["Unprivileged Debian 13 LXC — everything runs as user 'openclaw'"]
+        direction LR
+        novnc["noVNC<br/>:6080"] --> vnc["TigerVNC<br/>:5901"] --> desktop["LXQt desktop"]
+        desktop --> chrome["Google Chrome<br/>sandboxed"]
+        gateway["OpenClaw gateway<br/>:18789"]
+        chrome <-. "browser extension" .-> gateway
+    end
+
+    you -- "SSH tunnel (default)<br/>or HTTPS (EXPOSE_LAN=1)" --> novnc
+```
+
+The three long-running pieces are systemd services — `openclaw-gateway`, `vncserver` and `novnc` — and they start on boot together with the container.
+
+### What you see when it finishes
+
+An example summary (your values will differ):
+
+```text
+  ✔ OpenClaw is ready  (finished in 9m 42s)
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Container        105 (openclaw) · 10.1.1.186
+  SSH login        ssh openclaw@10.1.1.186   (no sudo; root shell: pct enter 105)
+
+  Remote desktop
+  URL              http://localhost:6080/vnc.html
+                   first run: ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 openclaw@10.1.1.186
+  VNC password     Ab3dEf9h
+
+  OpenClaw dashboard  (loopback only)
+  URL              http://localhost:18789/   or the Dashboard shortcut on the desktop
+  Auth token       3f2a…
+
+  Next steps
+    1. Open the remote desktop URL and sign in with the VNC password
+    2. Double-click "OpenClaw Setup Wizard" to configure channels and skills
+    3. Add the Chrome extension from the Chrome Web Store …
+```
+
+A private copy of this summary is saved on the Proxmox host as `/root/openclaw-lxc-<VMID>.txt` (readable by root only).
+
+## 🖥️ Using it
+
+By default the remote desktop and the dashboard listen on the container's **loopback only**. Open an SSH tunnel from your computer, then browse to them locally:
 
 ```bash
 ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 openclaw@<container-ip>
 ```
 
-| What | Address (through the tunnel) |
-|------|------------------------------|
-| **Remote Desktop** | `http://localhost:6080/vnc.html` |
-| **OpenClaw Dashboard** | `http://localhost:18789/` (or use the desktop shortcut, which fills in the token) |
-| **SSH** | `ssh openclaw@<container-ip>` (root SSH login is not enabled; use `pct enter <VMID>` for a root shell) |
+| What | Where | Notes |
+|---|---|---|
+| Remote desktop | `http://localhost:6080/vnc.html` | Sign in with the generated VNC password |
+| OpenClaw dashboard | `http://localhost:18789/` | Or use the desktop shortcut, which fills in the token |
+| Shell | `ssh openclaw@<container-ip>` | Root SSH is not enabled; use `pct enter <VMID>` for root |
 
-With `EXPOSE_LAN=1` the remote desktop is served directly at `https://<container-ip>:6080/vnc.html` (HTTPS only, self-signed certificate — accept the browser warning). The dashboard always stays on loopback: the OpenClaw Control UI needs a secure context (HTTPS or localhost), so open it from the desktop shortcut or through the tunnel.
+Prefer direct access on a trusted network? Install with `EXPOSE_LAN=1` and the desktop is served at `https://<container-ip>:6080/vnc.html` (self-signed certificate, HTTPS only). The dashboard always stays on loopback, because OpenClaw's Control UI needs a secure context.
 
-The script prints the access details, the auth token and the generated VNC password at the end.
+**Desktop shortcuts**
 
-## Desktop Shortcuts
+| Shortcut | Does |
+|---|---|
+| OpenClaw Setup Wizard | Runs `openclaw onboard` (without installing a second gateway service) |
+| OpenClaw Dashboard | Opens Chrome on the dashboard with your token already filled in |
+| Google Chrome | The default browser |
+| Terminal | lxterminal with a dark theme |
 
-Once you open the remote desktop via noVNC, you'll find these shortcuts ready to go:
+**First steps:** open the desktop → run the **Setup Wizard** → connect your channels and skills → add the **Chrome extension** from the [Chrome Web Store](https://chromewebstore.google.com/detail/kcdjddhmeafeomebliikmbpblkmkfoig) and check it with `openclaw browser extension status`.
 
-| Shortcut | What it does |
-|----------|-------------|
-| **Terminal** | Opens lxterminal |
-| **Google Chrome** | The default browser |
-| **OpenClaw Setup Wizard** | Opens the interactive onboarding wizard (`openclaw onboard`) to configure your channels, workspace, and skills |
-| **OpenClaw Dashboard** | Opens Chrome with the dashboard URL and auth token pre-filled — no manual token entry needed |
+## 🎛️ Configuration
 
-## Requirements
+Interactive prompts cover the essentials; everything below can also be preset as an environment variable (a preset value is never asked again).
 
-- Proxmox VE 8.x+ on an amd64 host (Google Chrome is amd64-only); a recent `pve-container` (≥ 6.0.10 reported) is needed for Debian 13 containers — run `apt full-upgrade` if `pct create` rejects the template
-- Root access on the Proxmox host
-- Internet connectivity (for downloading packages)
-
-## Configuration
-
-The script prompts interactively (all optional except the password). Every option can also be preset with an environment variable for unattended runs:
-
-```bash
-CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 EXPOSE_LAN=1 ./setup-openclaw-lxc.sh
-```
+<details open>
+<summary><b>Container</b></summary>
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `CT_PASSWORD` | *(required)* | Password of the `openclaw` user (SSH / sudo) |
-| `DISK_SIZE` | 32 | Root filesystem size in GB |
-| `MEMORY` | 4096 | RAM in MB |
-| `CORES` | 4 | CPU cores |
-| `VNC_RES` | 1920x1080 | Remote desktop resolution |
-| `EXPOSE_LAN` | 0 | `1` = serve noVNC on the LAN over HTTPS (the gateway stays on loopback) |
-| `PRIVILEGED` | 0 | `1` = create a privileged container (not recommended) |
-| `ONBOOT` | 1 | Start the container when the host boots |
-| `VMID` | next free (prompted) | Container ID; checked against existing guests |
-| `CT_HOSTNAME` | openclaw | Container hostname |
-| `BRIDGE` | prompted menu (default `vmbr0`) | Network bridge; the menu lists the bridges found on the host |
-| `IP_ADDRESS` | dhcp | `dhcp`, or a static IPv4 address in CIDR form such as `192.168.1.50/24` |
-| `GATEWAY` | first host of the network | Required for a static address; must be inside its network |
-| `NAMESERVER` | host resolver | DNS server(s), space separated (asked for static addresses) |
+|---|---|---|
+| `CT_PASSWORD` | *(required)* | Password of the `openclaw` user (SSH login) |
+| `VMID` | next free | Container ID, checked against existing guests |
+| `CT_HOSTNAME` | `openclaw` | Container hostname |
+| `DISK_SIZE` | `32` | Root disk in GB |
+| `MEMORY` | `4096` | RAM in MB |
+| `CORES` | `4` | CPU cores |
+| `SWAP` | `512` | Swap in MB |
+| `ROOT_STORAGE` | menu (default `local-lvm`) | Storage for the root disk; the menu shows type and free space |
+| `TMPL_STORAGE` | auto (`local`) | Storage for the Debian template |
+| `TIMEZONE` | `host` | e.g. `Europe/Berlin`, or `host` to follow the Proxmox host |
+| `ONBOOT` | `1` | Start the container when the host boots |
+| `PRIVILEGED` | `0` | `1` creates a privileged container (not recommended) |
+
+</details>
+
+<details>
+<summary><b>Network</b></summary>
+
+| Variable | Default | Description |
+|---|---|---|
+| `BRIDGE` | menu (default `vmbr0`) | Bridge to attach to; the menu lists the bridges found on the host |
+| `IP_ADDRESS` | `dhcp` | `dhcp`, or a static IPv4 address in CIDR form, e.g. `192.168.1.50/24` |
+| `GATEWAY` | first host of the network | Required for a static address; must lie inside it |
+| `NAMESERVER` | host resolver | DNS server(s), space separated |
 | `SEARCHDOMAIN` | *(none)* | DNS search domain |
-| `VLAN_TAG` | *(none)* | VLAN tag for the container's NIC (1–4094) |
-| `MTU` | *(bridge default)* | MTU for the container's NIC |
-| `SWAP` | 512 | Swap in MB |
-| `TIMEZONE` | host | Container timezone, e.g. `Europe/Berlin`, or `host` to follow the Proxmox host |
-| `ROOT_STORAGE` | prompted menu | Storage for the container disk; the menu lists enabled storages on the node with free space (default `local-lvm`) |
-| `TMPL_STORAGE` | auto | Storage for the Debian template (default `local`) |
-| `OPENCLAW_VERSION` | latest | npm version of OpenClaw to install (releases before 2026.9.3 have known security advisories; releases from 2026.9 need Node 24+) |
-| `NODE_MAJOR` | 24 | Node.js major version (current OpenClaw needs Node ≥ 24.16 <25 or ≥ 26.1) |
-| `HOMEBREW_INSTALL_REF` | HEAD | Git ref of the Homebrew installer |
+| `VLAN_TAG` | *(none)* | VLAN tag, 1–4094 |
+| `MTU` | *(bridge default)* | MTU of the container NIC |
 
-The VNC password is generated randomly and printed at the end. Answer `y` to "Configure advanced options" to be asked about VLAN, MTU, search domain, swap, timezone and start-on-boot; the same settings can always be preset through the environment. A static address is checked for validity and for an existing answer to ping before anything is created. Only IPv4 (or DHCP) is configured; add IPv6 afterwards in the container's Network settings.
+Static settings are validated (address form, gateway inside the network, DNS entries) and an address that already answers ping is refused. IPv4 and DHCP only; add IPv6 afterwards in the container's Network settings.
 
-Example with a static address on a VLAN:
+</details>
+
+<details>
+<summary><b>Access and desktop</b></summary>
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXPOSE_LAN` | `0` | `1` serves noVNC on the LAN over HTTPS; `0` keeps everything on loopback |
+| `VNC_RES` | `1920x1080` | Remote desktop resolution |
+
+</details>
+
+<details>
+<summary><b>Software versions</b></summary>
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENCLAW_VERSION` | `latest` | npm version of OpenClaw. Releases before 2026.9.3 have known security advisories; 2026.9+ needs Node 24 or newer |
+| `NODE_MAJOR` | `24` | Node.js major version (OpenClaw currently needs ≥ 24.16 <25, or ≥ 26.1) |
+| `HOMEBREW_INSTALL_REF` | `HEAD` | Git ref of the Homebrew installer to use |
+
+</details>
+
+**Command line:** `-y` / `--yes` skips the confirmation, `-h` / `--help` prints usage. Set `NO_COLOR=1` to disable colors.
+
+**What gets installed** (all inside the container, nothing on the Proxmox host): Node.js from the signed NodeSource apt repository, OpenClaw, Homebrew (for OpenClaw skills), LXQt, TigerVNC, noVNC, Google Chrome, OpenSSH, and the Noto Color Emoji font.
+
+## 🔒 Security model
+
+| Layer | Choice |
+|---|---|
+| Container | **Unprivileged** with nesting; a container escape needs more than a root process inside it |
+| Processes | Gateway, desktop and Chrome run as **`openclaw`**, not root; Chrome keeps its **sandbox** |
+| Privileges | `openclaw` has **no sudo**. Administer with `pct enter <VMID>` from the host |
+| Network | Only **SSH** is reachable by default; noVNC and the gateway are on loopback |
+| Remote desktop | Optional **HTTPS-only** noVNC (`EXPOSE_LAN=1`) with a generated certificate and a random VNC password |
+| Secrets | Passed to the container through a private file, never on command lines; the provisioning files are removed afterwards |
+| Supply chain | Node.js from a signed apt repository (no piped installers); versions can be pinned |
+
+What this does **not** do: the AI agent can still run commands as `openclaw` and browse the web for you, and VNC passwords are limited to 8 characters by the protocol. Treat the container like a machine you gave an intern: put it on a network segment you are comfortable with and keep the desktop on loopback unless you need otherwise.
+
+## 🧰 Day-2 operations
 
 ```bash
-CT_PASSWORD='s3cret' IP_ADDRESS=10.20.0.50/24 GATEWAY=10.20.0.1 NAMESERVER=10.20.0.1 VLAN_TAG=20 \
-  ./setup-openclaw-lxc.sh --yes
+pct enter <VMID>                       # root shell in the container
+pct stop <VMID> && pct start <VMID>    # restart it
+pct snapshot <VMID> before-upgrade     # snapshot before risky changes
+pct exec <VMID> -- systemctl status openclaw-gateway vncserver novnc
 ```
 
-## What the script installs
+**Update OpenClaw** (inside the container, as root): `npm install -g openclaw@latest`, then `systemctl restart openclaw-gateway`. Check the [Node requirement](#-configuration) when jumping versions.
 
-All inside the container (nothing is installed on the Proxmox host):
+**Start over / remove**: `pct stop <VMID>; pct destroy <VMID> --purge`. This deletes the container and its disk.
 
-- **Debian 13** LXC (unprivileged, nesting enabled)
-- A regular **`openclaw`** user that runs everything — nothing runs as root
-- **Node.js 24** (from the signed NodeSource apt repository) + **OpenClaw**
-- **Homebrew** (for OpenClaw skills)
-- **LXQt** desktop + **TigerVNC** + **noVNC**
-- **Google Chrome** with its sandbox enabled; the OpenClaw native host is registered, and you add the extension from the Chrome Web Store once (see below)
-- **Noto Color Emoji** font (for proper terminal rendering)
-- Three **systemd services**: `openclaw-gateway`, `vncserver`, `novnc`
+## 🩺 Troubleshooting
 
-## Container Management
+<details>
+<summary><b>The setup failed halfway</b></summary>
 
-```bash
-pct enter <VMID>       # Shell into the container
-pct stop <VMID>        # Stop the container
-pct start <VMID>       # Start the container
-pct status <VMID>      # Check container status
-```
+The script keeps the half-built container for inspection and offers to destroy it. To clean up by hand: `pct stop <VMID>; pct destroy <VMID> --purge`. The output of the failing command is shown right before the error.
 
-## Security model
+</details>
 
-- The container is **unprivileged**, and the gateway, desktop and Chrome run as the unprivileged `openclaw` user — an exploited browser or agent does not get root in the container, let alone on the host.
-- Nothing is reachable from the network except SSH unless you set `EXPOSE_LAN=1`, which exposes only noVNC, over HTTPS. The gateway always stays on loopback.
-- Secrets are handed to the container through a private file, not on command lines. The auth token and VNC password are printed once at the end; the dashboard shortcut file (readable only by `openclaw`) contains the token.
-- `openclaw` has no sudo rights at all. Use `pct enter <VMID>` for administration.
-- The remote desktop password is limited to 8 characters by the VNC protocol; treat noVNC as something to keep on loopback or a trusted network.
-- The AI agent can still run commands as `openclaw` and browse the web on your behalf. Run it on a network segment you are comfortable with.
+<details>
+<summary><b><code>pct create</code> rejects the Debian 13 template</b></summary>
 
-## Notes on the onboarding wizard
+Your `pve-container` package is too old for Debian 13. Update the host (`apt update && apt full-upgrade`) and run the installer again.
 
-When you run the **OpenClaw Setup Wizard** from the desktop shortcut, you may see two messages that look like errors but are perfectly normal:
+</details>
 
-**"Gateway service install failed"** — The wizard tries to create its own systemd service for the gateway, but our script already set up `openclaw-gateway.service` and it's already running. This is safe to ignore.
+<details>
+<summary><b>A service is not running</b></summary>
 
-**"SECURITY ERROR: ws:// to a non-loopback address"** — The gateway listens on loopback only, so you should not normally see this. If you reconfigure it to bind to the LAN, the token travels in clear text and the Control UI will not work over plain HTTP; use the SSH tunnel instead.
-
-The setup script already runs the gateway as a system service, so the wizard shortcut starts `openclaw onboard --skip-daemon` and tells it not to manage services. If you run the wizard yourself, decline any prompt to install a daemon. `openclaw dashboard` can also generate a one-time pairing link for the Control UI.
-
-The wizard may also offer to change the gateway's bind address or token, or to install its own service. Decline those: the `openclaw-gateway` service and the dashboard shortcut depend on the settings the setup script wrote.
-
-As long as you see your **channels connected**, a **Control UI URL**, and an **agent workspace** listed at the end of the wizard, everything worked.
-
-## Troubleshooting
-
-**Service not starting?**
 ```bash
 pct exec <VMID> -- systemctl status openclaw-gateway
-pct exec <VMID> -- systemctl status vncserver
-pct exec <VMID> -- systemctl status novnc
+pct exec <VMID> -- journalctl -u openclaw-gateway -n 50 --no-pager
 ```
 
-**Chrome extension not loading?**
-The setup script runs `openclaw browser extension install`, which registers the native messaging host (its output is saved to `~/openclaw-extension.txt` in the container). On Linux you then add the extension yourself from the [Chrome Web Store](https://chromewebstore.google.com/detail/kcdjddhmeafeomebliikmbpblkmkfoig) and can verify it with `openclaw browser extension status`. If the install step failed (it needs Chrome to have run once), re-run it as the `openclaw` user after starting Chrome. **Load unpacked** at `chrome://extensions` is only for local development builds (`--no-store`).
+Replace `openclaw-gateway` with `vncserver` or `novnc` as needed.
 
-**Chrome won't start (sandbox error)?**
-Chrome's sandbox needs user namespaces inside the container. As a last resort, run `echo --no-sandbox > /etc/openclaw/chrome-flags` as root in the container — this weakens isolation.
+</details>
 
-**Setup failed halfway?**
-The script keeps the half-built container for inspection and offers to destroy it. To start over: `pct stop <VMID>; pct destroy <VMID> --purge`.
+<details>
+<summary><b>Chrome does not start (sandbox error)</b></summary>
 
-## Contributing
+Chrome's sandbox needs user namespaces inside the container. As a last resort, run `echo --no-sandbox > /etc/openclaw/chrome-flags` as root in the container. This weakens isolation, so prefer fixing the namespace support first.
 
-Issues and pull requests are welcome at [yorch/openclaw-proxmox](https://github.com/yorch/openclaw-proxmox).
+</details>
 
-- The project is a single Bash script; see [CLAUDE.md](CLAUDE.md) for the architecture and conventions.
-- Run `shellcheck setup-openclaw-lxc.sh` (CI also checks the embedded in-container script) and `bash -n` before opening a PR.
-- There is no automated test suite; test changes by running the script on a Proxmox host.
+<details>
+<summary><b>The Chrome extension is missing</b></summary>
+
+The installer registers OpenClaw's native messaging host (output in `~/openclaw-extension.txt` in the container). On Linux you then add the extension from the [Chrome Web Store](https://chromewebstore.google.com/detail/kcdjddhmeafeomebliikmbpblkmkfoig). If the registration failed (Chrome has to have run once), start Chrome and run `openclaw browser extension install` as `openclaw`. Verify with `openclaw browser extension status`.
+
+</details>
+
+<details>
+<summary><b>The onboarding wizard shows warnings</b></summary>
+
+The gateway already runs as a system service, so the wizard shortcut starts `openclaw onboard --skip-daemon`. If you run the wizard yourself, decline prompts to install a daemon or to change the gateway's bind address or token — the services and the dashboard shortcut depend on the values the installer wrote. A "Gateway service install failed" message is therefore expected and safe to ignore. If you see a `ws://` security warning, the gateway has been moved off loopback; use the SSH tunnel instead.
+
+</details>
+
+## ❓ FAQ
+
+**Why unprivileged, and why not run as root?** An AI agent that executes commands and drives a browser is exactly the thing you want boxed in. Unprivileged containers plus a normal user mean a compromised agent or browser does not get root, in the container or on the host.
+
+**Why isn't the desktop on my LAN by default?** VNC is a weak protocol (8-character passwords). Loopback plus an SSH tunnel is the safest default; `EXPOSE_LAN=1` is there when you trust your network.
+
+**Can I run it on ARM?** Not yet — Google Chrome is installed from its amd64 package, so the installer stops early on other architectures.
+
+**Can I re-run it?** Each run creates a new container; it does not modify existing ones. Use a snapshot or `pct destroy` to roll back.
+
+## 🤝 Contributing
+
+Issues and pull requests are welcome. The project is a single Bash script; [CLAUDE.md](CLAUDE.md) explains its architecture and conventions.
+
+- Run `shellcheck setup-openclaw-lxc.sh` and `bash -n setup-openclaw-lxc.sh` before opening a PR; CI also lints the embedded in-container script.
+- There is no automated test suite — try changes on a Proxmox host.
 - Use [Conventional Commits](https://www.conventionalcommits.org/) (`fix:`, `feat:`, `docs:`, …).
 
-## Credits
+## 📜 Credits and license
 
-Forked from [adadrag/Openclaw-Proxmox](https://github.com/adadrag/Openclaw-Proxmox), the original project.
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
+Forked from [adadrag/Openclaw-Proxmox](https://github.com/adadrag/Openclaw-Proxmox) and substantially reworked. Released under the [MIT License](LICENSE).

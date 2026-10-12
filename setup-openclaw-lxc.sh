@@ -563,7 +563,7 @@ quiet() {
 }
 APT_OPTS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 apt_install() { quiet apt-get install -y "${APT_OPTS[@]}" "$@"; }
-as_user() { runuser -u "$CT_USER" -- env HOME="$USER_HOME" "$@"; }
+as_user() { runuser -u "$CT_USER" -- env HOME="$USER_HOME" OPENCLAW_HIDE_BANNER=1 "$@"; }
 
 # ── Base system ──────────────────────────────────────────────────────────────
 step "Updating packages and installing prerequisites"
@@ -655,14 +655,44 @@ GATEWAY_BIND=loopback
 as_user openclaw config set gateway.bind "$GATEWAY_BIND"
 as_user openclaw config set gateway.auth.token "$AUTH_TOKEN"
 
-# The extension installer needs Chrome's profile directory to exist, so start Chrome once.
+# Status markers for the host's summary
+install -d /etc/openclaw
+STATUS_FILE=/etc/openclaw/status
+: > "$STATUS_FILE"
+
+# Chrome must run once so its profile exists (the extension installer needs it). This also
+# proves the sandbox works in this container, which depends on user namespaces.
 step "Installing the OpenClaw browser extension"
-as_user timeout 30 /usr/bin/google-chrome-stable --headless=new --disable-gpu --no-first-run \
-    --dump-dom about:blank >/dev/null 2>&1 || true
-if as_user openclaw browser extension install > "$USER_HOME/openclaw-extension.txt" 2>&1; then
-    chown "$CT_USER:$CT_USER" "$USER_HOME/openclaw-extension.txt"
+install -d -o "$CT_USER" -g "$CT_USER" -m 0700 "$USER_HOME/.config/google-chrome"
+if as_user timeout 60 /usr/bin/google-chrome-stable --headless=new --disable-gpu --no-first-run \
+        --dump-dom about:blank >/dev/null 2>&1; then
+    echo "chrome=ok" >> "$STATUS_FILE"
 else
-    echo "WARNING: 'openclaw browser extension install' failed; see ${USER_HOME}/openclaw-extension.txt" >&2
+    echo "WARNING: Chrome could not start headless with its sandbox; see the README troubleshooting" >&2
+    echo "chrome=failed" >> "$STATUS_FILE"
+fi
+
+# `extension install` registers the native host, then waits for Chrome to confirm the
+# extension. On Linux the extension itself comes from the Chrome Web Store, so that wait
+# can never finish unattended and the command exits non-zero. Judge success by the
+# native-host registration instead.
+as_user timeout 90 openclaw browser extension install > "$USER_HOME/openclaw-extension.txt" 2>&1 || true
+if as_user openclaw browser extension status --json 2>/dev/null | node -e '
+let data = "";
+process.stdin.on("data", (chunk) => (data += chunk)).on("end", () => {
+    try {
+        const status = JSON.parse(data);
+        const ok = status.registrations.some((r) => r.product === "chrome" && r.state === "owned");
+        process.exit(ok ? 0 : 1);
+    } catch (e) {
+        process.exit(1);
+    }
+});
+'; then
+    echo "extension=registered" >> "$STATUS_FILE"
+else
+    echo "WARNING: the OpenClaw native host was not registered; see ${USER_HOME}/openclaw-extension.txt" >&2
+    echo "extension=failed" >> "$STATUS_FILE"
 fi
 
 # ── VNC ──────────────────────────────────────────────────────────────────────
@@ -689,7 +719,7 @@ echo '{ "resize": "scale" }' > /usr/share/novnc/defaults.json
 
 # ── noVNC listener: loopback-only unless exposure was requested, then HTTPS ──
 if [[ "$EXPOSE_LAN" == "1" ]]; then
-    step "Generating a self-signed certificate for noVNC"
+    echo "      generating a self-signed certificate for noVNC"
     install -d /etc/openclaw
     openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=${CT_HOSTNAME}" \
         -keyout /etc/openclaw/novnc.key -out /etc/openclaw/novnc.crt 2>/dev/null
@@ -789,10 +819,10 @@ StartupNotify=true
 DESKTOP
 cp /usr/local/share/applications/openclaw-chrome.desktop "$USER_HOME/Desktop/google-chrome.desktop"
 
-update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/google-chrome 250
-update-alternatives --set x-www-browser /usr/local/bin/google-chrome
-update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/google-chrome 250
-update-alternatives --set gnome-www-browser /usr/local/bin/google-chrome
+update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/google-chrome 250 >/dev/null
+update-alternatives --set x-www-browser /usr/local/bin/google-chrome >/dev/null
+update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/google-chrome 250 >/dev/null
+update-alternatives --set gnome-www-browser /usr/local/bin/google-chrome >/dev/null
 for mime in x-scheme-handler/http x-scheme-handler/https text/html; do
     as_user xdg-mime default openclaw-chrome.desktop "$mime"
 done
@@ -932,21 +962,56 @@ sleep 3
 stage "Verifying services"
 
 # ─── Verify services ─────────────────────────────────────────────────────────
-info "Verifying services..."
 SVC_FAILED=0
+
+# check LABEL COMMAND [TRIES] — run COMMAND in the container (every 2s) until it succeeds
+check() {
+    local label="$1" cmd="$2" tries="${3:-1}" i
+    for ((i = 0; i < tries; i++)); do
+        if ct_exec "$cmd" >/dev/null 2>&1; then
+            ok "$label"
+            return 0
+        fi
+        sleep 2
+    done
+    warn "$label — FAILED"
+    SVC_FAILED=1
+    return 0
+}
+
 for svc in openclaw-gateway vncserver novnc; do
     if ct_exec "systemctl is-active --quiet $svc"; then
-        ok "$svc is running."
+        ok "$svc is active."
     else
         SVC_FAILED=1
-        warn "$svc failed to start. Check with: pct exec $VMID -- systemctl status $svc"
+        warn "$svc is not active. Check with: pct exec $VMID -- systemctl status $svc"
     fi
 done
+
+info "Probing the services (the gateway can take up to a minute to start)..."
+check "Gateway answers on 127.0.0.1:18789" \
+    "curl -fsS -o /dev/null http://127.0.0.1:18789/healthz || curl -fsS -o /dev/null http://127.0.0.1:18789/" 45
+check "VNC server listens on 127.0.0.1:5901" "ss -ltn | grep -q '127.0.0.1:5901'" 10
+if [[ "$EXPOSE_LAN" == "1" ]]; then
+    check "noVNC answers over HTTPS on :6080" "curl -kfsS -o /dev/null https://127.0.0.1:6080/vnc.html" 10
+else
+    check "noVNC answers on 127.0.0.1:6080" "curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html" 10
+fi
+GATEWAY_RESTARTS=$(ct_exec "systemctl show -p NRestarts --value openclaw-gateway" 2>/dev/null || echo 0)
+if [[ "$GATEWAY_RESTARTS" =~ ^[0-9]+$ ]] && (( GATEWAY_RESTARTS > 0 )); then
+    warn "The gateway restarted ${GATEWAY_RESTARTS} time(s) since boot — check: pct exec $VMID -- journalctl -u openclaw-gateway -n 50"
+    SVC_FAILED=1
+fi
+
+CT_STATUS=$(ct_exec "cat /etc/openclaw/status 2>/dev/null" || true)
+if [[ "$CT_STATUS" == *chrome=failed* ]]; then
+    warn "Chrome could not start headless — its sandbox may not work in this container (see README → Troubleshooting)."
+fi
 
 # Re-detect IP in case it changed
 CT_IP=$(ct_ip)
 CT_IP="${CT_IP:-unknown}"
-EXT_INFO=$(ct_exec "cat /home/${CT_USER}/openclaw-extension.txt 2>/dev/null | tail -n 5" || true)
+if [[ "$CT_STATUS" == *extension=registered* ]]; then EXT_STATE="registered"; else EXT_STATE="failed"; fi
 
 # ─── Print connection info ────────────────────────────────────────────────────
 if [[ "$EXPOSE_LAN" == "1" ]]; then
@@ -961,7 +1026,7 @@ summary() {
     local rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
     if (( SVC_FAILED )); then
-        echo -e "${YELLOW}${BOLD}  ! OpenClaw is installed, but a service did not start${NC}  ${DIM}(see warnings above)${NC}"
+        echo -e "${YELLOW}${BOLD}  ! OpenClaw is installed, but a health check failed${NC}  ${DIM}(see warnings above)${NC}"
     else
         echo -e "${GREEN}${BOLD}  ✔ OpenClaw is ready${NC}  ${DIM}(finished in $(fmt_elapsed))${NC}"
     fi
@@ -981,11 +1046,11 @@ summary() {
     echo -e "  ${BOLD}${CYAN}Next steps${NC}"
     echo "    1. Open the remote desktop URL and sign in with the VNC password"
     echo "    2. Double-click \"OpenClaw Setup Wizard\" to configure channels and skills"
-    echo "    3. Add the Chrome extension from the Chrome Web Store (ID kcdjddhmeafeomebliikmbpblkmkfoig),"
-    echo "       then check it with: openclaw browser extension status"
-    if [[ -n "$EXT_INFO" ]]; then
-        echo -e "       ${DIM}extension install log (~/openclaw-extension.txt):${NC}"
-        while IFS= read -r line; do echo -e "       ${DIM}${line}${NC}"; done <<<"$EXT_INFO"
+    echo "    3. Add the Chrome extension from the Chrome Web Store (ID kcdjddhmeafeomebliikmbpblkmkfoig)"
+    if [[ "$EXT_STATE" == "registered" ]]; then
+        echo -e "       ${DIM}the OpenClaw native host is already registered; check with: openclaw browser extension status${NC}"
+    else
+        echo -e "       ${YELLOW}native host registration failed — see ~/openclaw-extension.txt in the container${NC}"
     fi
     echo
     echo -e "  ${BOLD}${CYAN}Manage${NC}  ${DIM}pct enter $VMID · pct stop $VMID · pct start $VMID${NC}"

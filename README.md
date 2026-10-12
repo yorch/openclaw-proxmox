@@ -83,7 +83,7 @@ The installer runs in six numbered stages and is safe to read top to bottom:
  [3/6] Creating the container
  [4/6] Waiting for the network
  [5/6] Provisioning the container            ← one strict script, [1/14] … [14/14]
- [6/6] Verifying services
+ [6/6] Verifying services                   ← service state plus HTTP/port probes
 ```
 
 What ends up running inside the container:
@@ -290,7 +290,7 @@ Chrome's sandbox needs user namespaces inside the container. As a last resort, r
 <details>
 <summary><b>The Chrome extension is missing</b></summary>
 
-The installer registers OpenClaw's native messaging host (output in `~/openclaw-extension.txt` in the container). On Linux you then add the extension from the [Chrome Web Store](https://chromewebstore.google.com/detail/kcdjddhmeafeomebliikmbpblkmkfoig). If the registration failed (Chrome has to have run once), start Chrome and run `openclaw browser extension install` as `openclaw`. Verify with `openclaw browser extension status`.
+The installer registers OpenClaw's native messaging host and reports it in the summary. The extension itself cannot be installed unattended on Linux: add it from the [Chrome Web Store](https://chromewebstore.google.com/detail/kcdjddhmeafeomebliikmbpblkmkfoig), then restart Chrome once if it was already open. Check the state with `openclaw browser extension status` (the `chrome` registration should be `owned`). The log of the registration is in `~/openclaw-extension.txt` in the container. For development you can instead load the unpacked copy from `~/.openclaw/browser/chrome-extension` at `chrome://extensions`. If registration failed, start Chrome once and run `openclaw browser extension install` as `openclaw`.
 
 </details>
 

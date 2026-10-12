@@ -18,7 +18,7 @@ The entire project is one Bash script (`setup-openclaw-lxc.sh`) with this flow:
 6. **Provisioning payload** — A single strict (`set -euo pipefail`) script, embedded as the `'PROVISION'` heredoc, is pushed with `pct push` together with a 0600 env file carrying secrets, then run once inside the container
 7. **Inside the container** (as the `openclaw` user where possible) — Node.js 24 (NodeSource apt repo; current OpenClaw needs Node ≥24.16 <25 or ≥26.1), Homebrew, OpenClaw, LXQt, TigerVNC, noVNC, Google Chrome, desktop config and shortcuts
 8. **Systemd services** — `openclaw-gateway` (18789), `vncserver` (:1/5901), `novnc` (6080); all run as `openclaw`, loopback-only; `EXPOSE_LAN=1` exposes only noVNC, `--ssl-only` with a self-signed cert (the Control UI needs a secure context, so the gateway never leaves loopback)
-9. **Verification** — Check services are active, print connection info
+9. **Verification** — `check()` probes (gateway HTTP, VNC port, noVNC, gateway restart count) plus service state and the provisioning status file `/etc/openclaw/status` (chrome sandbox probe, extension native-host registration); then print connection info
 10. **Failure handling** — `cleanup` EXIT trap offers to destroy a half-built container
 
 UX helpers (host script): `stage` (numbered `[n/6]` headings — keep `STEP_TOTAL` in sync when adding/removing stages), `info`/`ok`/`warn`/`err`, `kv` (aligned rows), and `summary` (final output; re-run without colors to write `/root/openclaw-lxc-<VMID>.txt`). Colors are off when stdout is not a TTY or `NO_COLOR` is set. The provisioning script counts its own `step "..."` calls for its `[n/N]` progress.

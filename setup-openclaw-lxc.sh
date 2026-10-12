@@ -288,8 +288,12 @@ info "Checking for Debian 13 template..."
 pveam update >/dev/null 2>&1 || warn "pveam update failed — using the cached template index."
 
 # Newest Debian 13 template in the index (version sort, not index order)
-TEMPLATE=$(pveam available --section system 2>/dev/null | grep -oP 'debian-13-standard_\S+' | sort -V | tail -n 1 || true)
-[[ -n "$TEMPLATE" ]] || fatal "Could not find a Debian 13 template. Check 'pveam available'."
+# The index can list several architectures; the container must match the host (arm64 sorts after
+# amd64, so an unfiltered "newest" pick would select an arm64 template and fail to start).
+HOST_ARCH=$(dpkg --print-architecture)
+TEMPLATE=$(pveam available --section system 2>/dev/null \
+    | grep -oP "debian-13-standard_\S+_${HOST_ARCH}\.tar\.\S+" | sort -V | tail -n 1 || true)
+[[ -n "$TEMPLATE" ]] || fatal "Could not find a Debian 13 ${HOST_ARCH} template. Check 'pveam available --section system'."
 
 # ─── Show the plan and confirm ───────────────────────────────────────────────
 echo

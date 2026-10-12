@@ -12,7 +12,7 @@
 #            BRIDGE IP_ADDRESS GATEWAY NAMESERVER SEARCHDOMAIN VLAN_TAG MTU SWAP TIMEZONE
 #            ENABLE_TAILSCALE TS_AUTHKEY TS_HOSTNAME
 #            TMPL_STORAGE ROOT_STORAGE ONBOOT PRIVILEGED NODE_MAJOR OPENCLAW_VERSION
-#            HOMEBREW_INSTALL_REF EXPOSE_LAN
+#            HOMEBREW_INSTALL_REF EXPOSE_LAN GITHUB_SSH_USER SSH_DISABLE_PASSWORD
 #
 
 set -euo pipefail
@@ -127,7 +127,7 @@ cleanup() {
     [[ -z "$WORKDIR" ]] || rm -rf "$WORKDIR"
     if (( rc != 0 && CT_CREATED )); then
         # Never leave the secrets file behind in a half-provisioned container
-        pct exec "$VMID" -- rm -f /root/provision.env /root/provision.sh /root/ts-authkey >/dev/null 2>&1 || true
+        pct exec "$VMID" -- rm -f /root/provision.env /root/provision.sh /root/ts-authkey /root/authorized_keys.github >/dev/null 2>&1 || true
         err "Setup failed. Container $VMID was left in place for inspection."
         err "  Inspect:  pct enter $VMID"
         err "  Remove:   pct stop $VMID; pct destroy $VMID --purge"
@@ -311,6 +311,120 @@ if [[ "$IP_ADDRESS" != "dhcp" ]] && command -v ping >/dev/null 2>&1; then
     fi
 fi
 
+# ── SSH keys from GitHub (optional) ──
+GITHUB_KEYS_MAX=50          # at most this many keys
+GITHUB_KEYS_MAX_BYTES=65536 # and at most this much data
+GITHUB_KEYS_FILE=""         # validated authorized_keys lines, set once keys were imported
+GITHUB_KEY_FPS=()           # "TYPE BITS SHA256:..." per imported key
+
+# fetch_github_keys USER OUTFILE — download https://github.com/USER.keys and write only the lines
+# that ssh-keygen accepts as public keys to OUTFILE, rebuilt as "TYPE BLOB github:USER" (nothing
+# else from the response is kept). Fills GITHUB_KEY_FPS. Prints the reason and returns 1 on failure.
+fetch_github_keys() {
+    local user="$1" out="$2" raw one line fp_out bits fp ktype http="" rc=0 size n=0 skipped=0
+    local key_re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+([A-Za-z0-9+/]+={0,3})([[:space:]].*)?$'
+    GITHUB_KEY_FPS=()
+    if ! [[ "$user" =~ ^[A-Za-z0-9]([A-Za-z0-9]|-[A-Za-z0-9])*$ ]] || (( ${#user} > 39 )); then
+        err "'$user' is not a valid GitHub username (letters, digits and single inner hyphens, at most 39)."
+        return 1
+    fi
+    command -v curl >/dev/null 2>&1 || { err "curl is needed to import SSH keys from GitHub."; return 1; }
+    command -v ssh-keygen >/dev/null 2>&1 || { err "ssh-keygen is needed to validate SSH keys."; return 1; }
+    raw="${out}.raw"
+    one="${out}.one"
+    rm -f "$out" "$raw" "$one"
+    http=$(curl -fsS --proto =https --tlsv1.2 --max-time 20 --max-filesize "$GITHUB_KEYS_MAX_BYTES" \
+        -o "$raw" -w '%{http_code}' "https://github.com/${user}.keys" 2>/dev/null) || rc=$?
+    if (( rc != 0 )); then
+        if [[ "$http" == "404" ]]; then
+            err "GitHub user '$user' was not found."
+        elif (( rc == 63 )); then
+            err "The key list of '$user' is larger than ${GITHUB_KEYS_MAX_BYTES} bytes; refusing it."
+        elif [[ "$http" =~ ^[1-9][0-9][0-9]$ && "$http" != "200" ]]; then
+            err "GitHub answered HTTP $http for https://github.com/${user}.keys."
+        elif (( rc == 22 )); then
+            err "GitHub returned an error for https://github.com/${user}.keys (is the username right?)."
+        else
+            err "Could not download https://github.com/${user}.keys (curl exit code $rc; network, DNS or TLS problem)."
+        fi
+        rm -f "$raw"
+        return 1
+    fi
+    size=$(wc -c < "$raw")
+    if (( size > GITHUB_KEYS_MAX_BYTES )); then
+        err "The key list of '$user' is larger than ${GITHUB_KEYS_MAX_BYTES} bytes; refusing it."
+        rm -f "$raw"
+        return 1
+    fi
+    : > "$out"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -n "${line//[[:space:]]/}" ]] || continue
+        if [[ ! "$line" =~ $key_re ]]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        printf '%s %s github:%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$user" > "$one"
+        if ! fp_out=$(ssh-keygen -l -E sha256 -f "$one" 2>/dev/null); then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        n=$((n + 1))
+        (( n <= GITHUB_KEYS_MAX )) || break
+        read -r bits fp _ <<<"$fp_out"
+        ktype="${fp_out##*(}"
+        GITHUB_KEY_FPS+=("${ktype%)} ${bits} ${fp}")
+        cat "$one" >> "$out"
+    done < "$raw"
+    rm -f "$raw" "$one"
+    if (( n > GITHUB_KEYS_MAX )); then
+        err "'$user' has more than ${GITHUB_KEYS_MAX} SSH keys on GitHub; refusing to import them."
+        rm -f "$out"
+        GITHUB_KEY_FPS=()
+        return 1
+    fi
+    (( skipped == 0 )) || warn "Ignored ${skipped} line(s) from GitHub that are not valid SSH public keys."
+    if (( n == 0 )); then
+        err "GitHub user '$user' has no usable public SSH keys."
+        rm -f "$out"
+        return 1
+    fi
+    return 0
+}
+
+GITHUB_SSH_USER="${GITHUB_SSH_USER:-}"
+if [[ -n "$GITHUB_SSH_USER" || -t 0 ]]; then
+    [[ -n "$WORKDIR" ]] || { WORKDIR=$(mktemp -d); chmod 700 "$WORKDIR"; }
+fi
+if [[ -n "$GITHUB_SSH_USER" ]]; then
+    # Preset (unattended): a failed import is an error, never a silent skip
+    fetch_github_keys "$GITHUB_SSH_USER" "$WORKDIR/authorized_keys.github" \
+        || fatal "Could not import SSH keys for GitHub user '$GITHUB_SSH_USER' (unset GITHUB_SSH_USER to install without keys)."
+    GITHUB_KEYS_FILE="$WORKDIR/authorized_keys.github"
+elif [[ -t 0 ]]; then
+    while true; do
+        read -rp "GitHub username to import SSH keys from (blank to skip): " GITHUB_SSH_USER
+        [[ -n "$GITHUB_SSH_USER" ]] || break
+        if fetch_github_keys "$GITHUB_SSH_USER" "$WORKDIR/authorized_keys.github"; then
+            GITHUB_KEYS_FILE="$WORKDIR/authorized_keys.github"
+            break
+        fi
+        warn "Try another username, or leave it blank to continue without SSH keys."
+    done
+fi
+if [[ -n "$GITHUB_KEYS_FILE" ]]; then
+    ok "Fetched ${#GITHUB_KEY_FPS[@]} SSH key(s) of github.com/${GITHUB_SSH_USER} (fingerprints are shown in the plan)."
+    if [[ -z "${SSH_DISABLE_PASSWORD:-}" && -t 0 ]]; then
+        read -rp "Disable SSH password login (keys only)? [y/N]: " SSH_DISABLE_PASSWORD_ANSWER
+        if [[ "$SSH_DISABLE_PASSWORD_ANSWER" =~ ^[Yy] ]]; then SSH_DISABLE_PASSWORD=1; else SSH_DISABLE_PASSWORD=0; fi
+    fi
+fi
+SSH_DISABLE_PASSWORD="${SSH_DISABLE_PASSWORD:-0}"
+[[ "$SSH_DISABLE_PASSWORD" =~ ^[01]$ ]] || fatal "SSH_DISABLE_PASSWORD must be 0 or 1."
+if [[ "$SSH_DISABLE_PASSWORD" == "1" && -z "$GITHUB_KEYS_FILE" ]]; then
+    fatal "SSH_DISABLE_PASSWORD=1 needs SSH keys — set GITHUB_SSH_USER as well."
+fi
+
 echo
 
 stage "Selecting storage and template"
@@ -435,6 +549,12 @@ if [[ "$ENABLE_TAILSCALE" == "1" ]]; then
     kv "Tailscale" "Serve as ${TS_HOSTNAME} · $([[ -n "$TS_AUTHKEY" ]] && echo "auth key" || echo "login link")"
 fi
 kv "Start on boot" "$([[ "$ONBOOT" == "1" ]] && echo yes || echo no)"
+if [[ -n "$GITHUB_KEYS_FILE" ]]; then
+    kv "SSH keys" "${#GITHUB_KEY_FPS[@]} from github.com/${GITHUB_SSH_USER} · password login $([[ "$SSH_DISABLE_PASSWORD" == "1" ]] && echo disabled || echo "stays enabled")"
+    for fp in "${GITHUB_KEY_FPS[@]}"; do kv "" "$fp"; done
+else
+    kv "SSH keys" "none (password login)"
+fi
 if [[ "$ASSUME_YES" != "1" && -t 0 ]]; then
     echo
     read -rp "Create the container with these settings? [Y/n]: " CONFIRM
@@ -554,7 +674,7 @@ AUTH_TOKEN=$(openssl rand -hex 16)
 VNC_PASSWORD=$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8)))')
 CT_USER="openclaw"
 
-WORKDIR=$(mktemp -d)
+[[ -n "$WORKDIR" ]] || WORKDIR=$(mktemp -d)
 chmod 700 "$WORKDIR"
 
 {
@@ -570,6 +690,7 @@ chmod 700 "$WORKDIR"
     printf 'HOMEBREW_INSTALL_REF=%q\n' "${HOMEBREW_INSTALL_REF:-HEAD}"
     printf 'ENABLE_TAILSCALE=%q\n'    "$ENABLE_TAILSCALE"
     printf 'TS_HOSTNAME=%q\n'         "$TS_HOSTNAME"
+    printf 'SSH_DISABLE_PASSWORD=%q\n' "$SSH_DISABLE_PASSWORD"
 } > "$WORKDIR/provision.env"
 
 cat > "$WORKDIR/provision.sh" <<'PROVISION'
@@ -579,7 +700,7 @@ set -euo pipefail
 
 # shellcheck disable=SC1091
 source /root/provision.env
-trap 'rm -f /root/provision.env /root/provision.sh /etc/sudoers.d/openclaw-provision; shred -u /root/ts-authkey 2>/dev/null || rm -f /root/ts-authkey' EXIT
+trap 'rm -f /root/provision.env /root/provision.sh /root/authorized_keys.github /etc/sudoers.d/openclaw-provision; shred -u /root/ts-authkey 2>/dev/null || rm -f /root/ts-authkey' EXIT
 
 export DEBIAN_FRONTEND=noninteractive
 USER_HOME="/home/${CT_USER}"
@@ -637,6 +758,27 @@ step "Creating user ${CT_USER}"
 id "$CT_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$CT_USER"
 chpasswd <<<"${CT_USER}:${CT_PASSWORD}"
 systemctl enable --now ssh >/dev/null 2>&1
+
+# SSH keys fetched from GitHub and validated on the host (optional)
+if [[ -s /root/authorized_keys.github ]]; then
+    echo "      authorizing the SSH keys imported from GitHub"
+    install -d -o "$CT_USER" -g "$CT_USER" -m 0700 "$USER_HOME/.ssh"
+    install -o "$CT_USER" -g "$CT_USER" -m 0600 /root/authorized_keys.github "$USER_HOME/.ssh/authorized_keys"
+    rm -f /root/authorized_keys.github
+    if [[ "$SSH_DISABLE_PASSWORD" == "1" ]]; then
+        echo "      disabling SSH password login"
+        install -d -m 0755 /etc/ssh/sshd_config.d
+        cat > /etc/ssh/sshd_config.d/10-openclaw.conf <<'SSHD'
+# Written by setup-openclaw-lxc.sh: key-only SSH login (keys imported from GitHub)
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+SSHD
+        /usr/sbin/sshd -t
+        systemctl reload ssh
+    fi
+elif [[ "$SSH_DISABLE_PASSWORD" == "1" ]]; then
+    echo "WARNING: no SSH keys were installed, so SSH password login stays enabled" >&2
+fi
 
 # ── Node.js (signed NodeSource apt repository, no piped installer) ───────────
 step "Installing Node.js ${NODE_MAJOR}"
@@ -1085,6 +1227,9 @@ stage "Provisioning the container"
 info "Installing packages, desktop, Chrome and OpenClaw — this takes several minutes."
 pct push "$VMID" "$WORKDIR/provision.env" /root/provision.env --perms 0600
 pct push "$VMID" "$WORKDIR/provision.sh"  /root/provision.sh  --perms 0700
+if [[ -n "$GITHUB_KEYS_FILE" ]]; then
+    pct push "$VMID" "$GITHUB_KEYS_FILE" /root/authorized_keys.github --perms 0600
+fi
 if [[ -n "$TS_AUTHKEY" ]]; then
     # The auth key goes in through a private file, never through a command line
     (umask 077; printf '%s' "$TS_AUTHKEY" > "$WORKDIR/ts-authkey")
@@ -1135,6 +1280,12 @@ if [[ "$EXPOSE_LAN" == "1" ]]; then
     check "noVNC answers over HTTPS on :6080" "curl -kfsS -o /dev/null https://127.0.0.1:6080/vnc.html" 10
 else
     check "noVNC answers on 127.0.0.1:6080" "curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html" 10
+fi
+if [[ -n "$GITHUB_KEYS_FILE" ]]; then
+    check "SSH keys from GitHub authorized for ${CT_USER}" "test -s /home/${CT_USER}/.ssh/authorized_keys"
+    if [[ "$SSH_DISABLE_PASSWORD" == "1" ]]; then
+        check "SSH password login disabled" "/usr/sbin/sshd -T | grep -qx 'passwordauthentication no'"
+    fi
 fi
 GATEWAY_RESTARTS=$(ct_exec "systemctl show -p NRestarts --value openclaw-gateway" 2>/dev/null || echo 0)
 if [[ "$GATEWAY_RESTARTS" =~ ^[0-9]+$ ]] && (( GATEWAY_RESTARTS > 0 )); then
@@ -1194,6 +1345,9 @@ summary() {
     echo -e "${DIM}  ${rule}${NC}"
     kv "Container" "$VMID ($CT_HOSTNAME) · $CT_IP"
     kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (no sudo; root shell: pct enter $VMID)"
+    if [[ -n "$GITHUB_KEYS_FILE" ]]; then
+        kv "" "${DIM}key login with your github.com/${GITHUB_SSH_USER} key(s) (${#GITHUB_KEY_FPS[@]}); password login $([[ "$SSH_DISABLE_PASSWORD" == "1" ]] && echo disabled || echo "also enabled")${NC}"
+    fi
     echo
     if (( TAILNET_UP )); then
         echo -e "  ${BOLD}${CYAN}Over your tailnet (Tailscale)${NC}"

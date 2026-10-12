@@ -144,7 +144,7 @@ ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 openclaw@<container-ip>
 |---|---|---|
 | Remote desktop | `http://localhost:6080/vnc.html` | Sign in with the generated VNC password |
 | OpenClaw dashboard | `http://localhost:18789/` | Or use the desktop shortcut, which fills in the token |
-| Shell | `ssh openclaw@<container-ip>` | Root SSH is not enabled; use `pct enter <VMID>` for root |
+| Shell | `ssh openclaw@<container-ip>` | Password, or your GitHub SSH keys with `GITHUB_SSH_USER`; root SSH is not enabled, use `pct enter <VMID>` for root |
 
 Prefer direct access on a trusted network? Install with `EXPOSE_LAN=1` and the desktop is served at `https://<container-ip>:6080/vnc.html` (self-signed certificate, HTTPS only). The dashboard always stays on loopback, because OpenClaw's Control UI needs a secure context.
 
@@ -225,6 +225,10 @@ Static settings are validated (address form, gateway inside the network, DNS ent
 |---|---|---|
 | `EXPOSE_LAN` | `0` | `1` serves noVNC on the LAN over HTTPS; `0` keeps everything on loopback |
 | `VNC_RES` | `1920x1080` | Remote desktop resolution |
+| `GITHUB_SSH_USER` | *(none)* | GitHub username whose public SSH keys are authorized for `openclaw` (see below) |
+| `SSH_DISABLE_PASSWORD` | `0` | `1` turns off SSH password login; only allowed together with `GITHUB_SSH_USER` |
+
+**SSH keys from GitHub.** Give a GitHub username (at the prompt or as `GITHUB_SSH_USER`) and the installer downloads `https://github.com/<user>.keys` on the Proxmox host over HTTPS, keeps only lines that `ssh-keygen` accepts as public keys (at most 50), and installs them as `~openclaw/.ssh/authorized_keys`. Each key's type and SHA256 fingerprint is listed in the plan, so you can compare them with `ssh-keygen -lf ~/.ssh/id_ed25519.pub` before you confirm. Afterwards `ssh openclaw@<container-ip>` logs in with your key; password login stays on unless you answer yes to the follow-up question or set `SSH_DISABLE_PASSWORD=1`. The keys are a snapshot taken at install time: adding or revoking keys on GitHub later does not change the container, so edit `authorized_keys` yourself. In an unattended run a failed import (unknown user, no keys, network error) stops the installer instead of silently continuing without keys.
 
 </details>
 
@@ -262,6 +266,7 @@ Static settings are validated (address form, gateway inside the network, DNS ent
 | Processes | Gateway, desktop and Chrome run as **`openclaw`**, not root; Chrome keeps its **sandbox** |
 | Privileges | `openclaw` has **no sudo**. Administer with `pct enter <VMID>` from the host |
 | Network | Only **SSH** is reachable by default; noVNC and the gateway are on loopback. With Tailscale they are published on your tailnet only (no Funnel) |
+| SSH | Optional **key login** with your GitHub public keys (fetched over HTTPS, validated, fingerprints shown for confirmation); `SSH_DISABLE_PASSWORD=1` makes it key-only |
 | Remote desktop | Optional **HTTPS-only** noVNC (`EXPOSE_LAN=1`) with a generated certificate and a random VNC password |
 | Secrets | Passed to the container through private files (including any Tailscale auth key), never on command lines; the files are removed afterwards |
 | Supply chain | Node.js from a signed apt repository (no piped installers); versions can be pinned |

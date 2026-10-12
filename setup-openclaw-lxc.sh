@@ -10,7 +10,7 @@
 #   CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 CORES=6 ./setup-openclaw-lxc.sh
 # Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME BRIDGE
 #            TMPL_STORAGE ROOT_STORAGE ONBOOT PRIVILEGED NODE_MAJOR OPENCLAW_VERSION
-#            HOMEBREW_INSTALL_REF
+#            HOMEBREW_INSTALL_REF EXPOSE_LAN
 #
 
 set -euo pipefail
@@ -108,6 +108,7 @@ ask DISK_SIZE "Disk size in GB"  32
 ask MEMORY    "Memory in MB"     4096
 ask CORES     "CPU cores"        4
 ask VNC_RES   "VNC resolution"   1920x1080
+ask EXPOSE_LAN "Expose noVNC (HTTPS) and the gateway on the LAN? 1=yes 0=no (loopback only, use an SSH tunnel)" 0
 CT_HOSTNAME="${CT_HOSTNAME:-openclaw}"
 BRIDGE="${BRIDGE:-vmbr0}"
 ONBOOT="${ONBOOT:-1}"
@@ -122,6 +123,7 @@ require_int CORES 1 512
 [[ "$CT_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fatal "Invalid hostname '$CT_HOSTNAME'."
 [[ "$BRIDGE" =~ ^[a-zA-Z0-9_.-]+$ ]] || fatal "Invalid bridge name '$BRIDGE'."
 [[ "$ONBOOT" =~ ^[01]$ ]] || fatal "ONBOOT must be 0 or 1."
+[[ "$EXPOSE_LAN" =~ ^[01]$ ]] || fatal "EXPOSE_LAN must be 0 or 1."
 ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist on this host."
 
 echo
@@ -240,6 +242,8 @@ ok "Container has network access."
 # Everything inside the container runs as ONE strict script (set -euo pipefail) that is
 # copied in with `pct push`. Secrets travel in a 0600 env file, never on a command line.
 AUTH_TOKEN=$(openssl rand -hex 16)
+# VNC only uses the first 8 characters of its password, so generate exactly 8 random ones
+VNC_PASSWORD=$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8)))')
 CT_USER="openclaw"
 
 WORKDIR=$(mktemp -d)
@@ -249,6 +253,9 @@ chmod 700 "$WORKDIR"
     printf 'CT_USER=%q\n'              "$CT_USER"
     printf 'CT_PASSWORD=%q\n'          "$CT_PASSWORD"
     printf 'AUTH_TOKEN=%q\n'           "$AUTH_TOKEN"
+    printf 'VNC_PASSWORD=%q\n'         "$VNC_PASSWORD"
+    printf 'EXPOSE_LAN=%q\n'           "$EXPOSE_LAN"
+    printf 'CT_HOSTNAME=%q\n'          "$CT_HOSTNAME"
     printf 'VNC_RES=%q\n'              "$VNC_RES"
     printf 'NODE_MAJOR=%q\n'           "${NODE_MAJOR:-22}"
     printf 'OPENCLAW_VERSION=%q\n'     "${OPENCLAW_VERSION:-latest}"
@@ -350,8 +357,14 @@ rm -f /tmp/chrome.deb
 # ── OpenClaw configuration ───────────────────────────────────────────────────
 step "Configuring OpenClaw"
 as_user openclaw config set gateway.mode local
-as_user openclaw config set gateway.bind lan
-as_user openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true
+if [[ "$EXPOSE_LAN" == "1" ]]; then
+    GATEWAY_BIND=lan
+    # Needed so the Control UI accepts requests addressed to the container's LAN IP
+    as_user openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true
+else
+    GATEWAY_BIND=loopback
+fi
+as_user openclaw config set gateway.bind "$GATEWAY_BIND"
 as_user openclaw config set gateway.auth.token "$AUTH_TOKEN"
 
 step "Installing the OpenClaw browser extension"
@@ -364,7 +377,7 @@ fi
 # ── VNC ──────────────────────────────────────────────────────────────────────
 step "Configuring VNC"
 install -d -o "$CT_USER" -g "$CT_USER" -m 0700 "$USER_HOME/.config" "$USER_HOME/.config/tigervnc"
-printf '%s\n' "$CT_PASSWORD" | vncpasswd -f > "$USER_HOME/.config/tigervnc/passwd"
+printf '%s\n' "$VNC_PASSWORD" | vncpasswd -f > "$USER_HOME/.config/tigervnc/passwd"
 chmod 600 "$USER_HOME/.config/tigervnc/passwd"
 
 cat > "$USER_HOME/.config/tigervnc/xstartup" <<'XSTARTUP'
@@ -378,6 +391,19 @@ chmod +x "$USER_HOME/.config/tigervnc/xstartup"
 # noVNC: scale the remote desktop to the browser window by default. defaults.json is
 # read by noVNC at runtime, so unlike patching ui.js it survives package upgrades.
 echo '{ "resize": "scale" }' > /usr/share/novnc/defaults.json
+
+# ── noVNC listener: loopback-only unless exposure was requested, then HTTPS ──
+if [[ "$EXPOSE_LAN" == "1" ]]; then
+    step "Generating a self-signed certificate for noVNC"
+    install -d /etc/openclaw
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=${CT_HOSTNAME}" \
+        -keyout /etc/openclaw/novnc.key -out /etc/openclaw/novnc.crt 2>/dev/null
+    chown "$CT_USER:$CT_USER" /etc/openclaw/novnc.key /etc/openclaw/novnc.crt
+    chmod 600 /etc/openclaw/novnc.key
+    NOVNC_ARGS="--cert=/etc/openclaw/novnc.crt --key=/etc/openclaw/novnc.key 0.0.0.0:6080"
+else
+    NOVNC_ARGS="127.0.0.1:6080"
+fi
 
 # ── Desktop configuration ────────────────────────────────────────────────────
 step "Configuring the desktop"
@@ -536,7 +562,7 @@ User=${CT_USER}
 Environment=HOME=${USER_HOME}
 Environment=NODE_ENV=production
 WorkingDirectory=${USER_HOME}
-ExecStart=${OPENCLAW_BIN} gateway run --bind lan --auth token
+ExecStart=${OPENCLAW_BIN} gateway run --bind ${GATEWAY_BIND} --auth token
 Restart=always
 RestartSec=5
 
@@ -572,7 +598,7 @@ Requires=vncserver.service
 [Service]
 Type=simple
 User=${CT_USER}
-ExecStart=${WEBSOCKIFY_BIN} --web=/usr/share/novnc/ 6080 localhost:5901
+ExecStart=${WEBSOCKIFY_BIN} --web=/usr/share/novnc/ ${NOVNC_ARGS} localhost:5901
 Restart=on-failure
 RestartSec=5
 
@@ -616,15 +642,27 @@ echo -e "${BOLD}╚════════════════════�
 echo
 echo -e "  ${BOLD}Container ID:${NC}  $VMID"
 echo -e "  ${BOLD}Container IP:${NC}  $CT_IP"
-echo -e "  ${BOLD}Login user:${NC}    $CT_USER (password: the one you entered)"
+echo -e "  ${BOLD}Login user:${NC}    $CT_USER (SSH / sudo password: the one you entered)"
 echo
-echo -e "  ${BOLD}OpenClaw Dashboard:${NC}"
-echo -e "    http://${CT_IP}:18789/"
-echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
-echo
-echo -e "  ${BOLD}noVNC (remote desktop):${NC}"
-echo -e "    http://${CT_IP}:6080/vnc.html"
-echo -e "    VNC password: first 8 characters of the container password"
+if [[ "$EXPOSE_LAN" == "1" ]]; then
+    echo -e "  ${BOLD}OpenClaw Dashboard:${NC}"
+    echo -e "    http://${CT_IP}:18789/   (plain HTTP — trusted networks only)"
+    echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
+    echo
+    echo -e "  ${BOLD}noVNC (remote desktop):${NC}"
+    echo -e "    https://${CT_IP}:6080/vnc.html   (self-signed certificate: accept the browser warning)"
+    echo -e "    VNC password: ${CYAN}${VNC_PASSWORD}${NC}"
+else
+    echo -e "  ${BOLD}Services listen on the container's loopback only.${NC} From your computer:"
+    echo -e "    ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 ${CT_USER}@${CT_IP}"
+    echo
+    echo -e "  ${BOLD}noVNC (remote desktop):${NC}  http://localhost:6080/vnc.html"
+    echo -e "    VNC password: ${CYAN}${VNC_PASSWORD}${NC}"
+    echo
+    echo -e "  ${BOLD}OpenClaw Dashboard:${NC}  http://localhost:18789/"
+    echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
+    echo -e "    (inside the remote desktop, the Dashboard shortcut opens it with the token filled in)"
+fi
 echo
 echo -e "  ${BOLD}Browser Extension:${NC}"
 echo -e "    Open Chrome → chrome://extensions → Enable Developer Mode"

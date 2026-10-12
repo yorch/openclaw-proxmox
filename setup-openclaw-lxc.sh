@@ -15,19 +15,71 @@
 
 set -euo pipefail
 
-# ─── Colors ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+# ─── Output helpers ───────────────────────────────────────────────────────────
+# Colors only on a terminal, and never when NO_COLOR is set (https://no-color.org)
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; CYAN=$'\033[0;36m'
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''
+fi
 
-info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+START_TIME=$SECONDS
+STEP_NO=0
+STEP_TOTAL=6
+
+info()  { echo -e "${CYAN}•${NC} $*"; }
+ok()    { echo -e "${GREEN}✔${NC} $*"; }
+warn()  { echo -e "${YELLOW}!${NC} $*"; }
+err()   { echo -e "${RED}✘ $*${NC}" >&2; }
 fatal() { err "$@"; exit 1; }
+
+# stage TITLE — numbered section heading
+stage() {
+    STEP_NO=$((STEP_NO + 1))
+    echo
+    echo -e "${BOLD}${CYAN}[${STEP_NO}/${STEP_TOTAL}]${NC} ${BOLD}$*${NC}"
+}
+
+# kv LABEL VALUE — aligned "label  value" line
+kv() { printf '  %s%-16s%s %s\n' "$BOLD" "$1" "$NC" "$2"; }
+
+fmt_elapsed() {
+    local t=$((SECONDS - START_TIME))
+    printf '%dm %02ds' $((t / 60)) $((t % 60))
+}
+
+print_banner() {
+    echo
+    echo -e "${BOLD}  OpenClaw on Proxmox${NC}"
+    echo -e "${DIM}  Debian 13 LXC · OpenClaw · LXQt desktop · Chrome · noVNC${NC}"
+}
+
+usage() {
+    cat <<'USAGE'
+Usage: setup-openclaw-lxc.sh [options]
+
+Creates a Debian 13 LXC on this Proxmox host and installs OpenClaw, an LXQt desktop,
+Google Chrome and VNC/noVNC. Run as root on the Proxmox host.
+
+Options:
+  -y, --yes    Do not ask for confirmation before creating the container
+  -h, --help   Show this help
+
+Every setting can also be preset through the environment (see the README), e.g.:
+  CT_PASSWORD='secret' DISK_SIZE=64 EXPOSE_LAN=1 ./setup-openclaw-lxc.sh --yes
+Set NO_COLOR=1 to disable colors.
+USAGE
+}
+
+ASSUME_YES="${ASSUME_YES:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+        -y|--yes)  ASSUME_YES=1 ;;
+        *)         fatal "Unknown option '$arg' (see --help)." ;;
+    esac
+done
 
 # ─── Cleanup on failure ──────────────────────────────────────────────────────
 VMID="${VMID:-}"
@@ -62,6 +114,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+print_banner
+stage "Checking the host and collecting settings"
+
 # ─── Pre-flight checks ───────────────────────────────────────────────────────
 command -v pct  >/dev/null 2>&1 || fatal "pct not found — this script must run on a Proxmox host."
 command -v pvesh >/dev/null 2>&1 || fatal "pvesh not found — this script must run on a Proxmox host."
@@ -90,14 +145,9 @@ require_int() { # require_int NAME MIN MAX
     fi
 }
 
-echo -e "${BOLD}╔═══════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║     OpenClaw LXC Setup for Proxmox               ║${NC}"
-echo -e "${BOLD}╚═══════════════════════════════════════════════════╝${NC}"
-echo
-
 if [[ -z "${CT_PASSWORD:-}" ]]; then
     [[ -t 0 ]] || fatal "No terminal available — set CT_PASSWORD in the environment."
-    read -rp "Password for the openclaw user (also VNC): " -s CT_PASSWORD
+    read -rp "Password for the 'openclaw' user (SSH login): " -s CT_PASSWORD
     echo
     read -rp "Confirm password: " -s CT_PASSWORD_CONFIRM
     echo
@@ -116,8 +166,9 @@ CT_HOSTNAME="${CT_HOSTNAME:-openclaw}"
 BRIDGE="${BRIDGE:-vmbr0}"
 ONBOOT="${ONBOOT:-1}"
 # Unprivileged by default; PRIVILEGED=1 is an explicit opt-in
-[[ "${PRIVILEGED:-0}" =~ ^[01]$ ]] || fatal "PRIVILEGED must be 0 or 1."
-UNPRIVILEGED=$(( 1 - ${PRIVILEGED:-0} ))
+PRIVILEGED="${PRIVILEGED:-0}"
+[[ "$PRIVILEGED" =~ ^[01]$ ]] || fatal "PRIVILEGED must be 0 or 1."
+UNPRIVILEGED=$(( 1 - PRIVILEGED ))
 
 require_int DISK_SIZE 4 100000
 require_int MEMORY 1024 1000000
@@ -131,6 +182,8 @@ DISK_SIZE=$((10#$DISK_SIZE)); MEMORY=$((10#$MEMORY)); CORES=$((10#$CORES))
 ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist on this host."
 
 echo
+
+stage "Selecting storage and template"
 
 # ─── Validate VMID ───────────────────────────────────────────────────────────
 [[ "$VMID" =~ ^[0-9]+$ ]] || fatal "Invalid VMID '$VMID'."
@@ -238,6 +291,25 @@ pveam update >/dev/null 2>&1 || warn "pveam update failed — using the cached t
 TEMPLATE=$(pveam available --section system 2>/dev/null | grep -oP 'debian-13-standard_\S+' | sort -V | tail -n 1 || true)
 [[ -n "$TEMPLATE" ]] || fatal "Could not find a Debian 13 template. Check 'pveam available'."
 
+# ─── Show the plan and confirm ───────────────────────────────────────────────
+echo
+echo -e "${BOLD}Plan${NC}"
+kv "Container ID" "$VMID ($CT_HOSTNAME)"
+kv "Resources" "${CORES} cores · ${MEMORY} MB RAM · ${DISK_SIZE} GB disk on ${ROOT_STORAGE}"
+kv "Template" "$TEMPLATE (from ${TMPL_STORAGE})"
+kv "Network" "DHCP on ${BRIDGE}"
+if [[ "$PRIVILEGED" == "1" ]]; then kv "Container type" "privileged (not recommended)"; else kv "Container type" "unprivileged, nesting enabled"; fi
+kv "Remote desktop" "${VNC_RES}, $([[ "$EXPOSE_LAN" == "1" ]] && echo "HTTPS on the LAN" || echo "loopback only (SSH tunnel)")"
+kv "Start on boot" "$([[ "$ONBOOT" == "1" ]] && echo yes || echo no)"
+if [[ "$ASSUME_YES" != "1" && -t 0 ]]; then
+    echo
+    read -rp "Create the container with these settings? [Y/n]: " CONFIRM
+    if [[ "$CONFIRM" =~ ^[Nn] ]]; then
+        warn "Aborted — nothing was changed."
+        exit 1
+    fi
+fi
+
 TEMPLATE_LIST=$(pveam list "$TMPL_STORAGE" 2>/dev/null || true)
 if [[ "$TEMPLATE_LIST" == *"$TEMPLATE"* ]]; then
     ok "Template already downloaded: $TEMPLATE"
@@ -246,6 +318,8 @@ else
     pveam download "$TMPL_STORAGE" "$TEMPLATE"
     ok "Template downloaded."
 fi
+
+stage "Creating the container"
 
 # ─── Create the LXC container ────────────────────────────────────────────────
 info "Creating LXC container $VMID..."
@@ -282,6 +356,8 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 ct_exec "true" >/dev/null 2>&1 || fatal "Container did not become reachable."
+
+stage "Waiting for the network"
 
 # ─── Wait for network ────────────────────────────────────────────────────────
 info "Waiting for DHCP lease (up to 60s)..."
@@ -340,7 +416,9 @@ export DEBIAN_FRONTEND=noninteractive
 USER_HOME="/home/${CT_USER}"
 cd /   # pct exec inherits the host's cwd, which the unprivileged user cannot read
 
-step() { echo "  → $*"; }
+STEP_NO=0
+STEP_TOTAL=$(grep -c '^step "' /root/provision.sh || true)
+step() { STEP_NO=$((STEP_NO + 1)); echo "  [${STEP_NO}/${STEP_TOTAL}] $*"; }
 
 # Run a command silently; replay its output only if it fails.
 quiet() {
@@ -701,8 +779,10 @@ systemctl start openclaw-gateway.service vncserver.service novnc.service \
     || echo "WARNING: at least one service failed to start (see systemctl status)" >&2
 PROVISION
 
+stage "Provisioning the container"
+
 # ─── Provision the container ─────────────────────────────────────────────────
-info "Provisioning the container (several minutes — packages, desktop, Chrome)..."
+info "Installing packages, desktop, Chrome and OpenClaw — this takes several minutes."
 pct push "$VMID" "$WORKDIR/provision.env" /root/provision.env --perms 0600
 pct push "$VMID" "$WORKDIR/provision.sh"  /root/provision.sh  --perms 0700
 pct exec "$VMID" -- bash /root/provision.sh
@@ -710,12 +790,16 @@ ok "Container provisioned."
 
 sleep 3
 
+stage "Verifying services"
+
 # ─── Verify services ─────────────────────────────────────────────────────────
 info "Verifying services..."
+SVC_FAILED=0
 for svc in openclaw-gateway vncserver novnc; do
     if ct_exec "systemctl is-active --quiet $svc"; then
         ok "$svc is running."
     else
+        SVC_FAILED=1
         warn "$svc failed to start. Check with: pct exec $VMID -- systemctl status $svc"
     fi
 done
@@ -726,40 +810,54 @@ CT_IP="${CT_IP:-unknown}"
 EXT_INFO=$(ct_exec "cat /home/${CT_USER}/openclaw-extension.txt 2>/dev/null | tail -n 5" || true)
 
 # ─── Print connection info ────────────────────────────────────────────────────
-echo
-echo -e "${BOLD}╔═══════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║           OpenClaw LXC Setup Complete!            ║${NC}"
-echo -e "${BOLD}╚═══════════════════════════════════════════════════╝${NC}"
-echo
-echo -e "  ${BOLD}Container ID:${NC}  $VMID"
-echo -e "  ${BOLD}Container IP:${NC}  $CT_IP"
-echo -e "  ${BOLD}Login user:${NC}    $CT_USER (SSH password: the one you entered; no sudo — use pct enter for root)"
-echo
-echo -e "  ${BOLD}noVNC (remote desktop):${NC}"
 if [[ "$EXPOSE_LAN" == "1" ]]; then
-    echo -e "    https://${CT_IP}:6080/vnc.html   (self-signed certificate: accept the browser warning)"
+    NOVNC_URL="https://${CT_IP}:6080/vnc.html"
+    TUNNEL_NOTE="self-signed certificate — accept the browser warning"
 else
-    echo -e "    http://localhost:6080/vnc.html   (after: ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 ${CT_USER}@${CT_IP})"
+    NOVNC_URL="http://localhost:6080/vnc.html"
+    TUNNEL_NOTE="first run: ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 ${CT_USER}@${CT_IP}"
 fi
-echo -e "    VNC password: ${CYAN}${VNC_PASSWORD}${NC}"
-echo
-echo -e "  ${BOLD}OpenClaw Dashboard${NC} (loopback only — use the desktop shortcut or the tunnel above):"
-echo -e "    http://localhost:18789/"
-echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
-echo
-echo -e "  ${BOLD}Browser Extension:${NC}"
-echo -e "    Add it from the Chrome Web Store (ID kcdjddhmeafeomebliikmbpblkmkfoig), then check it with"
-echo -e "    'openclaw browser extension status'. Install log: ~/openclaw-extension.txt"
-if [[ -n "$EXT_INFO" ]]; then
-    echo -e "    Output of 'openclaw browser extension install':"
-    while IFS= read -r line; do echo "      $line"; done <<<"$EXT_INFO"
+
+summary() {
+    local rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo
+    if (( SVC_FAILED )); then
+        echo -e "${YELLOW}${BOLD}  ! OpenClaw is installed, but a service did not start${NC}  ${DIM}(see warnings above)${NC}"
+    else
+        echo -e "${GREEN}${BOLD}  ✔ OpenClaw is ready${NC}  ${DIM}(finished in $(fmt_elapsed))${NC}"
+    fi
+    echo -e "${DIM}  ${rule}${NC}"
+    kv "Container" "$VMID ($CT_HOSTNAME) · $CT_IP"
+    kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (no sudo; root shell: pct enter $VMID)"
+    echo
+    echo -e "  ${BOLD}${CYAN}Remote desktop${NC}"
+    kv "URL" "$NOVNC_URL"
+    kv "" "${DIM}${TUNNEL_NOTE}${NC}"
+    kv "VNC password" "${CYAN}${VNC_PASSWORD}${NC}"
+    echo
+    echo -e "  ${BOLD}${CYAN}OpenClaw dashboard${NC}  ${DIM}(loopback only)${NC}"
+    kv "URL" "http://localhost:18789/   ${DIM}or the Dashboard shortcut on the desktop${NC}"
+    kv "Auth token" "${CYAN}${AUTH_TOKEN}${NC}"
+    echo
+    echo -e "  ${BOLD}${CYAN}Next steps${NC}"
+    echo "    1. Open the remote desktop URL and sign in with the VNC password"
+    echo "    2. Double-click \"OpenClaw Setup Wizard\" to configure channels and skills"
+    echo "    3. Add the Chrome extension from the Chrome Web Store (ID kcdjddhmeafeomebliikmbpblkmkfoig),"
+    echo "       then check it with: openclaw browser extension status"
+    if [[ -n "$EXT_INFO" ]]; then
+        echo -e "       ${DIM}extension install log (~/openclaw-extension.txt):${NC}"
+        while IFS= read -r line; do echo -e "       ${DIM}${line}${NC}"; done <<<"$EXT_INFO"
+    fi
+    echo
+    echo -e "  ${BOLD}${CYAN}Manage${NC}  ${DIM}pct enter $VMID · pct stop $VMID · pct start $VMID${NC}"
+    echo -e "${DIM}  ${rule}${NC}"
+}
+
+summary
+
+# Keep a private copy of the connection details (plain text, root only)
+INFO_FILE="/root/openclaw-lxc-${VMID}.txt"
+if (umask 077; BOLD='' DIM='' CYAN='' GREEN='' YELLOW='' NC='' summary > "$INFO_FILE" 2>/dev/null); then
+    echo -e "  ${DIM}Connection details saved to ${INFO_FILE} (readable by root only).${NC}"
+    echo
 fi
-echo
-echo -e "  ${BOLD}SSH:${NC}"
-echo -e "    ssh ${CT_USER}@${CT_IP}   (root SSH login is disabled; use 'pct enter $VMID' for a root shell)"
-echo
-echo -e "  ${BOLD}Manage container:${NC}"
-echo -e "    pct enter $VMID"
-echo -e "    pct stop $VMID"
-echo -e "    pct start $VMID"
-echo

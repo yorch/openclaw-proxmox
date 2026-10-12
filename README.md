@@ -24,9 +24,11 @@ SSH into your Proxmox host and run:
 bash <(curl -fsSL https://raw.githubusercontent.com/yorch/openclaw-proxmox/main/setup-openclaw-lxc.sh)
 ```
 
-That's it. The script asks for a password, the container ID (VMID), the storage for the disk and a few sizing options (every prompt has a sensible default), then prints your connection details when done.
+That's it. The script asks for a password, the container ID (VMID), the storage for the disk and a few sizing options (every prompt has a sensible default), shows a summary of the plan for you to confirm, then prints your connection details when done. A private copy of those details is saved to `/root/openclaw-lxc-<VMID>.txt` on the Proxmox host (readable by root only).
 
 Prefer to read it first? It's one file — download it (see below) and review it before running.
+
+Options: `-y` / `--yes` skips the confirmation, `-h` / `--help` shows usage, and `NO_COLOR=1` disables colors. The install runs in six numbered stages, so you can see where it is.
 
 ### Alternative install methods
 

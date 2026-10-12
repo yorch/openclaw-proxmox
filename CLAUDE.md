@@ -21,6 +21,8 @@ The entire project is one Bash script (`setup-openclaw-lxc.sh`) with this flow:
 9. **Verification** — Check services are active, print connection info
 10. **Failure handling** — `cleanup` EXIT trap offers to destroy a half-built container
 
+UX helpers (host script): `stage` (numbered `[n/6]` headings — keep `STEP_TOTAL` in sync when adding/removing stages), `info`/`ok`/`warn`/`err`, `kv` (aligned rows), and `summary` (final output; re-run without colors to write `/root/openclaw-lxc-<VMID>.txt`). Colors are off when stdout is not a TTY or `NO_COLOR` is set. The provisioning script counts its own `step "..."` calls for its `[n/N]` progress.
+
 Key helpers: `ct_exec()` wraps `pct exec $VMID -- bash -c` for small host-driven checks; inside the provisioning script `quiet` (silent unless failing), `apt_install` and `as_user` (runuser as `openclaw`).
 
 ## Development Notes

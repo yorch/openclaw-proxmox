@@ -106,6 +106,7 @@ fi
 [[ -n "$CT_PASSWORD" ]] || fatal "Password cannot be empty."
 [[ "$CT_PASSWORD" != *$'\n'* ]] || fatal "Password cannot contain newlines."
 
+ask VMID      "Container ID (VMID)" "$(pvesh get /cluster/nextid 2>/dev/null || echo 100)"
 ask DISK_SIZE "Disk size in GB"  32
 ask MEMORY    "Memory in MB"     4096
 ask CORES     "CPU cores"        4
@@ -131,13 +132,10 @@ ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist
 
 echo
 
-# ─── Auto-detect next VMID ───────────────────────────────────────────────────
-info "Selecting VMID..."
-if [[ -z "$VMID" ]]; then
-    VMID=$(pvesh get /cluster/nextid 2>/dev/null) || fatal "Could not get the next free VMID from the cluster."
-fi
+# ─── Validate VMID ───────────────────────────────────────────────────────────
 [[ "$VMID" =~ ^[0-9]+$ ]] || fatal "Invalid VMID '$VMID'."
-pvesh get /cluster/nextid --vmid "$VMID" >/dev/null 2>&1 || fatal "VMID $VMID is already in use."
+pvesh get /cluster/nextid --vmid "$VMID" >/dev/null 2>&1 \
+    || fatal "VMID $VMID is already in use (or outside Proxmox's allowed range 100-999999999)."
 ok "Will use VMID: $VMID"
 
 # ─── Auto-detect storage ─────────────────────────────────────────────────────
@@ -149,28 +147,82 @@ node_storage() {
     pvesh get "/nodes/$NODE/storage" --content "$1" --enabled 1 --output-format json 2>/dev/null
 }
 
-# Template storage: prefer "local", else the first one that accepts vztmpl
-TMPL_STORAGE="${TMPL_STORAGE:-$(node_storage vztmpl | python3 -c '
-import json, sys
-names = [s["storage"] for s in json.load(sys.stdin)]
-print("local" if "local" in names else (names[0] if names else ""))
-' 2>/dev/null || true)}"
-[[ -n "$TMPL_STORAGE" ]] || fatal "No enabled storage on node '$NODE' accepts container templates (vztmpl)."
+# in_array NEEDLE ITEM... — true if NEEDLE is one of the items
+in_array() {
+    local needle="$1" item
+    shift
+    for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+    return 1
+}
 
-# Rootfs storage: prefer local-lvm, else the rootdir storage with the most free space
-ROOT_STORAGE="${ROOT_STORAGE:-$(node_storage rootdir | python3 -c '
+# pick_storage VAR CONTENT LABEL PREFERRED INTERACTIVE
+#   Sets VAR to an enabled storage on this node that accepts CONTENT. A preset VAR is
+#   validated; otherwise the user chooses from a menu (INTERACTIVE=1 on a TTY) or PREFERRED /
+#   the storage with the most free space is used.
+pick_storage() {
+    local var="$1" content="$2" label="$3" preferred="$4" interactive="$5"
+    local json rows name type avail default choice n=0
+    local -a names=() avails=()
+
+    json=$(node_storage "$content" || true)
+    rows=$(python3 -c '
 import json, sys
 stores = json.load(sys.stdin)
-names = [s["storage"] for s in stores]
-if "local-lvm" in names:
-    print("local-lvm")
-elif stores:
-    print(max(stores, key=lambda s: s.get("avail", 0))["storage"])
-' 2>/dev/null || true)}"
-[[ -n "$ROOT_STORAGE" ]] || fatal "No enabled storage on node '$NODE' accepts container root disks (rootdir)."
+for s in sorted(stores, key=lambda s: -s.get("avail", 0)):
+    print("%s\t%s\t%.1f" % (s["storage"], s.get("type", "?"), s.get("avail", 0) / 2**30))
+' <<<"$json" 2>/dev/null || true)
+    [[ -n "$rows" ]] || fatal "No enabled storage on node '$NODE' accepts $label ($content)."
+
+    while IFS=$'\t' read -r name type avail; do
+        names+=("$name")
+        avails+=("$avail")
+    done <<<"$rows"
+
+    if [[ -n "${!var:-}" ]]; then
+        in_array "${!var}" "${names[@]}" \
+            || fatal "Storage '${!var}' cannot be used for $label. Available: ${names[*]}"
+        return 0
+    fi
+
+    default="${names[0]}"
+    if in_array "$preferred" "${names[@]}"; then default="$preferred"; fi
+
+    if [[ "$interactive" == "1" && -t 0 && ${#names[@]} -gt 1 ]]; then
+        echo "Available storage for $label:"
+        while IFS=$'\t' read -r name type avail; do
+            n=$((n + 1))
+            printf '  %d) %-20s %-10s %8s GB free%s\n' "$n" "$name" "$type" "$avail" \
+                "$([[ "$name" == "$default" ]] && echo '  (default)')"
+        done <<<"$rows"
+        read -rp "Select $label [$default]: " choice
+        if [[ -z "$choice" ]]; then
+            choice="$default"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
+            choice="${names[choice - 1]}"
+        fi
+        in_array "$choice" "${names[@]}" || fatal "Invalid storage selection '$choice'."
+        default="$choice"
+    fi
+    printf -v "$var" '%s' "$default"
+}
+
+TMPL_STORAGE="${TMPL_STORAGE:-}"
+ROOT_STORAGE="${ROOT_STORAGE:-}"
+pick_storage TMPL_STORAGE vztmpl  "container templates" local     0
+pick_storage ROOT_STORAGE rootdir "the container disk"  local-lvm 1
 
 ok "Template storage: $TMPL_STORAGE"
 ok "Rootfs storage:   $ROOT_STORAGE"
+
+ROOT_AVAIL=$(node_storage rootdir | python3 -c '
+import json, sys
+for s in json.load(sys.stdin):
+    if s["storage"] == sys.argv[1]:
+        print(int(s.get("avail", 0) / 2**30))
+' "$ROOT_STORAGE" 2>/dev/null || true)
+if [[ "$ROOT_AVAIL" =~ ^[0-9]+$ ]] && (( ROOT_AVAIL < DISK_SIZE )); then
+    warn "Storage '$ROOT_STORAGE' reports only ~${ROOT_AVAIL} GB free for a ${DISK_SIZE} GB disk (fine for thin-provisioned storage)."
+fi
 
 # Debian 13 templates need a recent pve-container (reported fixed in 6.0.10 on PVE 9)
 PVE_CONTAINER_VERSION=$(dpkg-query -W -f='${Version}' pve-container 2>/dev/null || true)

@@ -12,7 +12,7 @@ The entire project is one Bash script (`setup-openclaw-lxc.sh`) with this flow:
 
 1. **Pre-flight** — Verify Proxmox CLI tools (`pct`, `pvesh`, `pveam`), python3/openssl, root, amd64
 2. **Settings** — Environment variables first, then prompts (`ask()`); all inputs validated
-3. **Auto-detection** — VMID via `/cluster/nextid`; per-node enabled storage via `pvesh /nodes/<node>/storage` JSON + Python
+3. **VMID & storage** — VMID prompt defaults to `/cluster/nextid` and is validated; `pick_storage()` lists per-node enabled storage (`pvesh /nodes/<node>/storage` JSON + Python) as a menu, or validates a preset `ROOT_STORAGE`/`TMPL_STORAGE`
 4. **Template management** — Download newest Debian 13 template if missing
 5. **Container creation** — Unprivileged (nesting) by default, `PRIVILEGED=1` opts out; DHCP; `--onboot`
 6. **Provisioning payload** — A single strict (`set -euo pipefail`) script, embedded as the `'PROVISION'` heredoc, is pushed with `pct push` together with a 0600 env file carrying secrets, then run once inside the container

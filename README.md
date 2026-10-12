@@ -98,15 +98,16 @@ CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 EXPOSE_LAN=1 ./setup-openclaw-lxc.
 | `EXPOSE_LAN` | 0 | `1` = serve noVNC on the LAN over HTTPS (the gateway stays on loopback) |
 | `PRIVILEGED` | 0 | `1` = create a privileged container (not recommended) |
 | `ONBOOT` | 1 | Start the container when the host boots |
-| `VMID` | next free | Container ID |
+| `VMID` | next free (prompted) | Container ID; checked against existing guests |
 | `CT_HOSTNAME` | openclaw | Container hostname |
 | `BRIDGE` | vmbr0 | Network bridge (DHCP) |
-| `TMPL_STORAGE` / `ROOT_STORAGE` | auto | Template / root disk storage |
+| `ROOT_STORAGE` | prompted menu | Storage for the container disk; the menu lists enabled storages on the node with free space (default `local-lvm`) |
+| `TMPL_STORAGE` | auto | Storage for the Debian template (default `local`) |
 | `OPENCLAW_VERSION` | latest | npm version of OpenClaw to install |
 | `NODE_MAJOR` | 22 | Node.js major version |
 | `HOMEBREW_INSTALL_REF` | HEAD | Git ref of the Homebrew installer |
 
-The VNC password is generated randomly and printed at the end. VMID, storage and networking are auto-detected.
+The VNC password is generated randomly and printed at the end. Networking is DHCP on the chosen bridge.
 
 ## What the script installs
 

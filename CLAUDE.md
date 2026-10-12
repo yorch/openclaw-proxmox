@@ -8,30 +8,31 @@ OpenClaw on Proxmox is a single-script deployment tool (`setup-openclaw-lxc.sh`)
 
 ## Architecture
 
-The entire project is one ~460-line Bash script with this flow:
+The entire project is one Bash script (`setup-openclaw-lxc.sh`) with this flow:
 
-1. **Pre-flight** — Verify Proxmox CLI tools (`pct`, `pvesh`, `pveam`) and root access
-2. **User prompts** — Collect container password, disk/memory/CPU/resolution settings
-3. **Auto-detection** — Find next VMID and storage backends via `pvesh` JSON + Python parsing
-4. **Template management** — Download Debian 13 template if missing
-5. **Container creation** — Privileged LXC, DHCP networking
-6. **Package installation** — Node.js 22, Homebrew (as non-root `brewuser`), OpenClaw (npm global), LXQt, TigerVNC, noVNC, Google Chrome, OpenClaw browser extension
-7. **Configuration** — OpenClaw gateway settings, VNC password/xstartup, noVNC auto-scaling patch, Chrome as default browser
-8. **Desktop integration** — Desktop shortcuts for onboarding wizard and dashboard
-9. **Systemd services** — Three auto-starting services: `openclaw-gateway` (port 18789), `vncserver` (:1/5901), `novnc` (port 6080)
-10. **Verification** — Check all services are active, print connection info
+1. **Pre-flight** — Verify Proxmox CLI tools (`pct`, `pvesh`, `pveam`), python3/openssl, root, amd64
+2. **Settings** — Environment variables first, then prompts (`ask()`); all inputs validated
+3. **Auto-detection** — VMID via `/cluster/nextid`; per-node enabled storage via `pvesh /nodes/<node>/storage` JSON + Python
+4. **Template management** — Download newest Debian 13 template if missing
+5. **Container creation** — Unprivileged (nesting) by default, `PRIVILEGED=1` opts out; DHCP; `--onboot`
+6. **Provisioning payload** — A single strict (`set -euo pipefail`) script, embedded as the `'PROVISION'` heredoc, is pushed with `pct push` together with a 0600 env file carrying secrets, then run once inside the container
+7. **Inside the container** (as the `openclaw` user where possible) — Node.js (NodeSource apt repo), Homebrew, OpenClaw, LXQt, TigerVNC, noVNC, Google Chrome, desktop config and shortcuts
+8. **Systemd services** — `openclaw-gateway` (18789), `vncserver` (:1/5901), `novnc` (6080); all run as `openclaw`, loopback-only unless `EXPOSE_LAN=1` (then noVNC uses a self-signed TLS cert)
+9. **Verification** — Check services are active, print connection info
+10. **Failure handling** — `cleanup` EXIT trap offers to destroy a half-built container
 
-Key helper: `ct_exec()` wraps `pct exec $VMID -- bash -c` for all in-container commands.
+Key helpers: `ct_exec()` wraps `pct exec $VMID -- bash -c` for small host-driven checks; inside the provisioning script `quiet` (silent unless failing), `apt_install` and `as_user` (runuser as `openclaw`).
 
 ## Development Notes
 
-- No build system, test suite, or linter — this is a standalone Bash script
-- Uses `set -euo pipefail` for strict error handling
-- All in-container operations use heredoc-embedded config files (systemd units, desktop files, wrapper scripts)
-- Colorized output via `info()`, `ok()`, `warn()`, `err()`, `fatal()` helper functions
-- Homebrew is installed under a dedicated `brewuser` account (non-root requirement) with a symlink at `/usr/local/bin/brew` for root access
-- The noVNC auto-scaling patch modifies `/usr/share/novnc/app/ui.js` in-place via `sed`
-- Auth token is generated with `openssl rand -hex 16`
+- No build system or test suite; CI (`.github/workflows/lint.yml`) runs `bash -n` and ShellCheck on the host script AND on the embedded provisioning script (extracted between `cat > "$WORKDIR/provision.sh" <<'PROVISION'` and `PROVISION`). Run `shellcheck` locally before committing.
+- The provisioning script is a quoted heredoc: no escaping needed inside it. Values come from the sourced env file (`printf %q` on the host). Files inside it that need variable expansion use an unquoted inner heredoc.
+- Never put secrets on a command line; add them to `provision.env`.
+- Chrome runs with its sandbox; extra flags go in `/etc/openclaw/chrome-flags` via the `/usr/local/bin/google-chrome` wrapper. We ship our own `.desktop` file rather than editing the package's.
+- Homebrew is installed by the `openclaw` user; a temporary sudoers grant exists only during the installer.
+- noVNC auto-scaling is set with `/usr/share/novnc/defaults.json`, not by patching `ui.js`.
+- Auth token: `openssl rand -hex 16`; VNC password: random 8 alphanumerics (VNC truncates at 8).
+- Use Conventional Commits.
 
 ## Testing Changes
 
@@ -41,12 +42,12 @@ There is no automated test infrastructure. To test changes, run the script on a 
 bash setup-openclaw-lxc.sh
 ```
 
-Verify by checking: container creation, all three systemd services running, noVNC web access, and OpenClaw dashboard reachability.
+Verify by checking: container creation, all three systemd services running, noVNC web access (via SSH tunnel, or HTTPS with `EXPOSE_LAN=1`), Chrome starting with its sandbox, and OpenClaw dashboard reachability.
 
 ## Shell Style
 
-- Bash with `set -euo pipefail`
+- Bash with `set -euo pipefail` (host script and provisioning script)
 - Double-quoted variables throughout
-- Heredocs for multi-line content (both quoted `'EOF'` and unquoted `EOF` depending on variable expansion needs)
-- `grep -v` to suppress noisy apt/install output
+- Heredocs for multi-line content (quoted `'EOF'` unless variable expansion is needed)
+- Use `quiet` rather than `grep -v`/`tail` pipes to suppress noisy output, so failures are not masked
 - Python3 one-liners for JSON parsing of Proxmox API output

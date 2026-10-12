@@ -26,7 +26,7 @@ Run one command on your Proxmox host and get a ready-to-use **[OpenClaw](https:/
 |  |  |
 |---|---|
 | 🧱 **Contained** | Unprivileged LXC, everything runs as a regular user — never as root |
-| 🔒 **Private by default** | Nothing is exposed to the network except SSH; opt in to an HTTPS desktop on your LAN |
+| 🔒 **Private by default** | Nothing is exposed to the network except SSH; opt in to Tailscale or an HTTPS desktop on your LAN |
 | 🖥️ **A desktop for your agent** | LXQt + Google Chrome + noVNC, so the assistant has a real browser and you can watch it work |
 | ⚙️ **Configurable** | Pick VMID, storage, bridge, static IP, VLAN, resources — interactively or from environment variables |
 | 🛡️ **Fails loudly** | Strict error handling inside and outside the container; a failed run offers to clean up after itself |
@@ -148,6 +148,24 @@ ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 openclaw@<container-ip>
 
 Prefer direct access on a trusted network? Install with `EXPOSE_LAN=1` and the desktop is served at `https://<container-ip>:6080/vnc.html` (self-signed certificate, HTTPS only). The dashboard always stays on loopback, because OpenClaw's Control UI needs a secure context.
 
+### Remote access with Tailscale (optional)
+
+Answer yes to **Enable Tailscale** (or set `ENABLE_TAILSCALE=1`, or provide `TS_AUTHKEY`) and the container joins your tailnet and publishes both services over HTTPS with real certificates — no SSH tunnel, nothing on your LAN:
+
+| What | Address |
+|---|---|
+| Dashboard | `https://<hostname>.<tailnet>.ts.net/` |
+| Remote desktop | `https://<hostname>.<tailnet>.ts.net:8443/vnc.html` |
+
+- **Login:** paste an auth key at the prompt (it is read silently and handed to the container through a private file), or leave it blank and open the login link the installer prints. Tagged, pre-approved, non-reusable keys are best.
+- **Token still required:** the dashboard uses OpenClaw's own Tailscale Serve integration, and `gateway.auth.allowTailscale` is turned off, so being on your tailnet is not enough — the auth token is always needed.
+- **Prerequisites:** MagicDNS and HTTPS certificates enabled on your tailnet, and Serve allowed. If they aren't, the installer says so and prints the command to re-run.
+- **No `/dev/net/tun`?** The installer first tries to pass the TUN device through to the container. If that isn't possible it runs Tailscale in userspace networking mode: publishing works the same, but the container itself can't open connections to other tailnet devices.
+- The `openclaw` user is made the Tailscale *operator* (required for OpenClaw-managed Serve), which means that user — and so the agent — can reconfigure Tailscale on this node.
+- **First browser login needs approval:** because the token is mandatory and Tailscale identity is not trusted on its own, the first time a browser opens the tailnet dashboard OpenClaw asks to pair it. Approve it from the container: `openclaw devices list`, then `openclaw devices approve <requestId>`.
+- **Key expiry:** in OpenClaw's Serve mode the gateway will not start while the node's Tailscale key is expired, which would also take down the loopback dashboard. Disable key expiry for this node in the Tailscale admin console. The way back is `openclaw config set gateway.tailscale.mode off` and a gateway restart.
+- Tailscale Funnel (public internet) and Tailscale SSH are deliberately not set up.
+
 **Desktop shortcuts**
 
 | Shortcut | Does |
@@ -211,6 +229,17 @@ Static settings are validated (address form, gateway inside the network, DNS ent
 </details>
 
 <details>
+<summary><b>Tailscale</b></summary>
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_TAILSCALE` | `0` | `1` installs Tailscale and publishes the dashboard and noVNC on your tailnet (implied when `TS_AUTHKEY` is set) |
+| `TS_AUTHKEY` | *(prompted)* | Auth key for an unattended join; blank means "log in with a link". Pass it through the environment, never as an argument |
+| `TS_HOSTNAME` | container hostname | Node name on the tailnet |
+
+</details>
+
+<details>
 <summary><b>Software versions</b></summary>
 
 | Variable | Default | Description |
@@ -232,9 +261,9 @@ Static settings are validated (address form, gateway inside the network, DNS ent
 | Container | **Unprivileged** with nesting; a container escape needs more than a root process inside it |
 | Processes | Gateway, desktop and Chrome run as **`openclaw`**, not root; Chrome keeps its **sandbox** |
 | Privileges | `openclaw` has **no sudo**. Administer with `pct enter <VMID>` from the host |
-| Network | Only **SSH** is reachable by default; noVNC and the gateway are on loopback |
+| Network | Only **SSH** is reachable by default; noVNC and the gateway are on loopback. With Tailscale they are published on your tailnet only (no Funnel) |
 | Remote desktop | Optional **HTTPS-only** noVNC (`EXPOSE_LAN=1`) with a generated certificate and a random VNC password |
-| Secrets | Passed to the container through a private file, never on command lines; the provisioning files are removed afterwards |
+| Secrets | Passed to the container through private files (including any Tailscale auth key), never on command lines; the files are removed afterwards |
 | Supply chain | Node.js from a signed apt repository (no piped installers); versions can be pinned |
 
 What this does **not** do: the AI agent can still run commands as `openclaw` and browse the web for you, and VNC passwords are limited to 8 characters by the protocol. Treat the container like a machine you gave an intern: put it on a network segment you are comfortable with and keep the desktop on loopback unless you need otherwise.
@@ -265,6 +294,15 @@ The script keeps the half-built container for inspection and offers to destroy i
 <summary><b><code>pct create</code> rejects the Debian 13 template</b></summary>
 
 Your `pve-container` package is too old for Debian 13. Update the host (`apt update && apt full-upgrade`) and run the installer again.
+
+</details>
+
+<details>
+<summary><b>Tailscale did not come up</b></summary>
+
+- **Login link timed out:** finish it inside the container: `tailscale up --hostname=<name> --accept-dns=false --operator=openclaw`, then publish noVNC with `tailscale serve --bg --https=8443 http://127.0.0.1:6080` (use `https+insecure://127.0.0.1:6080` if you installed with `EXPOSE_LAN=1`). To have OpenClaw publish the dashboard, run as `openclaw`: `openclaw config set gateway.tailscale.mode serve` and `openclaw config set gateway.auth.allowTailscale false`, then `systemctl restart openclaw-gateway`.
+- **`tailscale serve` failed:** enable HTTPS certificates and Serve for your tailnet in the Tailscale admin console (DNS / settings), then re-run the command above.
+- **Userspace mode:** check `pct config <VMID>` for a `dev0: /dev/net/tun` line. Without it the installer uses userspace networking (publishing works; outbound tailnet connections don't).
 
 </details>
 

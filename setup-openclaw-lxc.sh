@@ -10,6 +10,7 @@
 #   CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 CORES=6 ./setup-openclaw-lxc.sh
 # Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME
 #            BRIDGE IP_ADDRESS GATEWAY NAMESERVER SEARCHDOMAIN VLAN_TAG MTU SWAP TIMEZONE
+#            ENABLE_TAILSCALE TS_AUTHKEY TS_HOSTNAME
 #            TMPL_STORAGE ROOT_STORAGE ONBOOT PRIVILEGED NODE_MAJOR OPENCLAW_VERSION
 #            HOMEBREW_INSTALL_REF EXPOSE_LAN
 #
@@ -126,7 +127,7 @@ cleanup() {
     [[ -z "$WORKDIR" ]] || rm -rf "$WORKDIR"
     if (( rc != 0 && CT_CREATED )); then
         # Never leave the secrets file behind in a half-provisioned container
-        pct exec "$VMID" -- rm -f /root/provision.env /root/provision.sh >/dev/null 2>&1 || true
+        pct exec "$VMID" -- rm -f /root/provision.env /root/provision.sh /root/ts-authkey >/dev/null 2>&1 || true
         err "Setup failed. Container $VMID was left in place for inspection."
         err "  Inspect:  pct enter $VMID"
         err "  Remove:   pct stop $VMID; pct destroy $VMID --purge"
@@ -199,6 +200,20 @@ ask CORES     "CPU cores"        4
 ask VNC_RES   "VNC resolution"   1920x1080
 ask EXPOSE_LAN "Expose noVNC on the LAN over HTTPS? 1=yes 0=no (loopback only, use an SSH tunnel)" 0
 ask CT_HOSTNAME "Hostname" openclaw
+
+# ── Tailscale (optional) ──
+# Providing an auth key implies that you want Tailscale
+if [[ -z "${ENABLE_TAILSCALE:-}" && -n "${TS_AUTHKEY:-}" ]]; then ENABLE_TAILSCALE=1; fi
+ask ENABLE_TAILSCALE "Enable Tailscale (private HTTPS access over your tailnet)? 1=yes 0=no" 0
+TS_HOSTNAME="${TS_HOSTNAME:-$CT_HOSTNAME}"
+if [[ "$ENABLE_TAILSCALE" == "1" && -z "${TS_AUTHKEY:-}" && -t 0 ]]; then
+    read -rp "Tailscale auth key (leave blank to log in with a link): " -s TS_AUTHKEY
+    echo
+fi
+TS_AUTHKEY="${TS_AUTHKEY:-}"
+if [[ "$ENABLE_TAILSCALE" == "1" && -z "$TS_AUTHKEY" && ! -t 0 ]]; then
+    fatal "Tailscale needs an auth key when there is no terminal — set TS_AUTHKEY (the login link needs someone to open it)."
+fi
 
 # ── Networking ──
 mapfile -t BRIDGES < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 \
@@ -285,6 +300,9 @@ PY
 fi
 [[ "$ONBOOT" =~ ^[01]$ ]] || fatal "ONBOOT must be 0 or 1."
 [[ "$EXPOSE_LAN" =~ ^[01]$ ]] || fatal "EXPOSE_LAN must be 0 or 1."
+[[ "$ENABLE_TAILSCALE" =~ ^[01]$ ]] || fatal "ENABLE_TAILSCALE must be 0 or 1."
+[[ "$TS_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fatal "Invalid Tailscale hostname '$TS_HOSTNAME'."
+[[ "$TS_AUTHKEY" != *[[:space:]]* ]] || fatal "The Tailscale auth key must not contain whitespace."
 ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist on this host."
 
 if [[ "$IP_ADDRESS" != "dhcp" ]] && command -v ping >/dev/null 2>&1; then
@@ -413,6 +431,9 @@ if [[ -n "$NAMESERVER$SEARCHDOMAIN" ]]; then kv "DNS" "${NAMESERVER:-host defaul
 kv "Swap / timezone" "${SWAP} MB · ${TIMEZONE}"
 if [[ "$PRIVILEGED" == "1" ]]; then kv "Container type" "privileged (not recommended)"; else kv "Container type" "unprivileged, nesting enabled"; fi
 kv "Remote desktop" "${VNC_RES}, $([[ "$EXPOSE_LAN" == "1" ]] && echo "HTTPS on the LAN" || echo "loopback only (SSH tunnel)")"
+if [[ "$ENABLE_TAILSCALE" == "1" ]]; then
+    kv "Tailscale" "Serve as ${TS_HOSTNAME} · $([[ -n "$TS_AUTHKEY" ]] && echo "auth key" || echo "login link")"
+fi
 kv "Start on boot" "$([[ "$ONBOOT" == "1" ]] && echo yes || echo no)"
 if [[ "$ASSUME_YES" != "1" && -t 0 ]]; then
     echo
@@ -436,6 +457,8 @@ stage "Creating the container"
 
 # ─── Create the LXC container ────────────────────────────────────────────────
 info "Creating LXC container $VMID..."
+FEATURES="nesting=1"
+
 NET0="name=eth0,bridge=${BRIDGE}"
 if [[ "$IP_ADDRESS" == "dhcp" ]]; then
     NET0+=",ip=dhcp"
@@ -459,11 +482,26 @@ pct create "$VMID" "${TMPL_STORAGE}:vztmpl/${TEMPLATE}" \
     --timezone "$TIMEZONE" \
     "${PCT_EXTRA[@]}" \
     --unprivileged "$UNPRIVILEGED" \
-    --features nesting=1 \
+    --features "$FEATURES" \
     --onboot "$ONBOOT" \
     --start 0
 CT_CREATED=1
 ok "Container $VMID created."
+
+if [[ "$ENABLE_TAILSCALE" == "1" ]]; then
+    # Tailscale needs /dev/net/tun. If this cannot be granted, provisioning falls back to
+    # Tailscale's userspace networking (Serve keeps working; outbound tailnet traffic does not).
+    info "Granting the container access to /dev/net/tun for Tailscale..."
+    if DEV_ERR=$(pct set "$VMID" --dev0 /dev/net/tun 2>&1); then
+        ok "TUN device passed through."
+    elif printf '%s\n' 'lxc.cgroup2.devices.allow: c 10:200 rwm' \
+            'lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file' \
+            >> "/etc/pve/lxc/${VMID}.conf" 2>/dev/null; then
+        ok "TUN device configured through the LXC config."
+    else
+        warn "Could not configure /dev/net/tun (${DEV_ERR:-no details}) — Tailscale will use userspace networking."
+    fi
+fi
 
 info "Starting container $VMID..."
 pct start "$VMID"
@@ -530,6 +568,8 @@ chmod 700 "$WORKDIR"
     printf 'NODE_MAJOR=%q\n'           "${NODE_MAJOR:-24}"
     printf 'OPENCLAW_VERSION=%q\n'     "${OPENCLAW_VERSION:-latest}"
     printf 'HOMEBREW_INSTALL_REF=%q\n' "${HOMEBREW_INSTALL_REF:-HEAD}"
+    printf 'ENABLE_TAILSCALE=%q\n'    "$ENABLE_TAILSCALE"
+    printf 'TS_HOSTNAME=%q\n'         "$TS_HOSTNAME"
 } > "$WORKDIR/provision.env"
 
 cat > "$WORKDIR/provision.sh" <<'PROVISION'
@@ -539,14 +579,20 @@ set -euo pipefail
 
 # shellcheck disable=SC1091
 source /root/provision.env
-trap 'rm -f /root/provision.env /root/provision.sh /etc/sudoers.d/openclaw-provision' EXIT
+trap 'rm -f /root/provision.env /root/provision.sh /etc/sudoers.d/openclaw-provision; shred -u /root/ts-authkey 2>/dev/null || rm -f /root/ts-authkey' EXIT
 
 export DEBIAN_FRONTEND=noninteractive
 USER_HOME="/home/${CT_USER}"
+# Status markers for the host's summary
+install -d /etc/openclaw
+STATUS_FILE=/etc/openclaw/status
+: > "$STATUS_FILE"
 cd /   # pct exec inherits the host's cwd, which the unprivileged user cannot read
 
 STEP_NO=0
 STEP_TOTAL=$(grep -c '^step "' /root/provision.sh || true)
+# The Tailscale step is written indented (inside an if) so the grep above skips it
+if [[ "$ENABLE_TAILSCALE" == "1" ]]; then STEP_TOTAL=$((STEP_TOTAL + 1)); fi
 step() { STEP_NO=$((STEP_NO + 1)); echo "  [${STEP_NO}/${STEP_TOTAL}] $*"; }
 
 # Run a command silently; replay its output only if it fails.
@@ -646,6 +692,90 @@ curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64
 apt_install /tmp/chrome.deb
 rm -f /tmp/chrome.deb
 
+# ── Tailscale (optional): private HTTPS access to the dashboard and noVNC ────
+# Tailscale is optional, so nothing in here may abort the whole install: every command is
+# chained with && inside functions (set -e does not apply there) and failures are reported.
+TS_STATE=off
+TS_AFTER=""
+
+ts_install() {
+    # Official signed apt repository for Debian trixie
+    install -d -m 0755 /usr/share/keyrings &&
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg \
+        -o /usr/share/keyrings/tailscale-archive-keyring.gpg &&
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list \
+        -o /etc/apt/sources.list.d/tailscale.list &&
+    quiet apt-get update &&
+    ts_configure_tun &&
+    apt_install tailscale &&
+    systemctl enable --now tailscaled >/dev/null 2>&1 &&
+    sleep 3
+}
+
+# Without a usable TUN device run tailscaled in userspace mode. Written before the package is
+# installed so the service never starts misconfigured; PORT is needed by the packaged unit.
+ts_configure_tun() {
+    if ( exec 3<>/dev/net/tun ) 2>/dev/null; then
+        echo "      using the TUN device"
+    else
+        echo "      /dev/net/tun is not available: using Tailscale userspace networking"
+        printf 'PORT="41641"\nFLAGS="--tun=userspace-networking"\n' > /etc/default/tailscaled
+    fi
+}
+
+# Does the tailnet allow HTTPS certificates (MagicDNS + HTTPS enabled)?
+ts_has_cert_domains() {
+    tailscale status --json | node -e '
+let data = "";
+process.stdin.on("data", (chunk) => (data += chunk)).on("end", () => {
+    try { process.exit((JSON.parse(data).CertDomains || []).length > 0 ? 0 : 1); } catch (e) { process.exit(1); }
+});
+'
+}
+
+if [[ "$ENABLE_TAILSCALE" == "1" ]]; then
+    TS_STATE=failed
+    step "Installing and connecting Tailscale"
+    if ! ts_install; then
+        echo "WARNING: installing Tailscale failed; continuing without it (see the output above)." >&2
+    else
+        TS_UP_ARGS=(--hostname="$TS_HOSTNAME" --accept-dns=false --operator="$CT_USER")
+        if [[ -f /root/ts-authkey ]]; then
+            TS_UP_ARGS+=(--auth-key=file:/root/ts-authkey)
+        else
+            echo "      no auth key given: open the login link below to approve this device (waits up to 10 minutes)"
+        fi
+        if timeout 600 tailscale up "${TS_UP_ARGS[@]}"; then
+            shred -u /root/ts-authkey 2>/dev/null || rm -f /root/ts-authkey
+
+            # noVNC gets its own port; OpenClaw owns HTTPS 443 for the dashboard. With EXPOSE_LAN
+            # noVNC speaks TLS (self-signed) on loopback, so Serve must talk TLS to it too.
+            if [[ "$EXPOSE_LAN" == "1" ]]; then NOVNC_TARGET="https+insecure://127.0.0.1:6080"; else NOVNC_TARGET="http://127.0.0.1:6080"; fi
+            TS_RECOVER="tailscale serve --bg --https=8443 ${NOVNC_TARGET}; then as ${CT_USER}: openclaw config set gateway.tailscale.mode serve && openclaw config set gateway.auth.allowTailscale false; systemctl restart openclaw-gateway"
+            if ! ts_has_cert_domains; then
+                echo "WARNING: this tailnet has no HTTPS certificate domain. Enable MagicDNS and HTTPS certificates in the Tailscale admin console (DNS page), then run: ${TS_RECOVER}" >&2
+                TS_STATE=connected
+            elif timeout 300 tailscale serve --bg --https=8443 "$NOVNC_TARGET"; then
+                TS_DNS=$(tailscale status --json | node -e '
+let data = "";
+process.stdin.on("data", (chunk) => (data += chunk)).on("end", () => {
+    console.log(JSON.parse(data).Self.DNSName.replace(/\.$/, ""));
+});
+' || true)
+                TS_STATE=up
+                TS_AFTER=" tailscaled.service"
+                echo "tailscale_dns=${TS_DNS}" >> "$STATUS_FILE"
+            else
+                echo "WARNING: Tailscale is connected but 'tailscale serve' failed (is Serve enabled for your tailnet?). Fix that, then run: ${TS_RECOVER}" >&2
+                TS_STATE=connected
+            fi
+        else
+            echo "WARNING: Tailscale login did not complete. Finish it with: tailscale up --hostname=${TS_HOSTNAME} --accept-dns=false --operator=${CT_USER} — then publish with: tailscale serve --bg --https=8443 http://127.0.0.1:6080 (https+insecure:// if EXPOSE_LAN=1); as ${CT_USER}: openclaw config set gateway.tailscale.mode serve && openclaw config set gateway.auth.allowTailscale false; systemctl restart openclaw-gateway" >&2
+        fi
+    fi
+fi
+echo "tailscale=${TS_STATE}" >> "$STATUS_FILE"
+
 # ── OpenClaw configuration ───────────────────────────────────────────────────
 step "Configuring OpenClaw"
 as_user openclaw config set gateway.mode local
@@ -653,12 +783,13 @@ as_user openclaw config set gateway.mode local
 # the gateway stays on loopback even with EXPOSE_LAN=1; reach it from the desktop or a tunnel.
 GATEWAY_BIND=loopback
 as_user openclaw config set gateway.bind "$GATEWAY_BIND"
+if [[ "$TS_STATE" == "up" ]]; then
+    # OpenClaw-managed Tailscale Serve (HTTPS 443 -> the loopback gateway). The token stays
+    # mandatory: do not accept Tailscale identity alone, since the agent shares this host.
+    as_user openclaw config set gateway.tailscale.mode serve
+    as_user openclaw config set gateway.auth.allowTailscale false
+fi
 as_user openclaw config set gateway.auth.token "$AUTH_TOKEN"
-
-# Status markers for the host's summary
-install -d /etc/openclaw
-STATUS_FILE=/etc/openclaw/status
-: > "$STATUS_FILE"
 
 # Chrome must run once so its profile exists (the extension installer needs it). This also
 # proves the sandbox works in this container, which depends on user namespaces.
@@ -878,8 +1009,8 @@ step "Creating systemd services"
 cat > /etc/systemd/system/openclaw-gateway.service <<SVC
 [Unit]
 Description=OpenClaw Gateway
-After=network-online.target
-Wants=network-online.target
+After=network-online.target${TS_AFTER}
+Wants=network-online.target${TS_AFTER}
 StartLimitBurst=10
 StartLimitIntervalSec=300
 
@@ -954,6 +1085,12 @@ stage "Provisioning the container"
 info "Installing packages, desktop, Chrome and OpenClaw — this takes several minutes."
 pct push "$VMID" "$WORKDIR/provision.env" /root/provision.env --perms 0600
 pct push "$VMID" "$WORKDIR/provision.sh"  /root/provision.sh  --perms 0700
+if [[ -n "$TS_AUTHKEY" ]]; then
+    # The auth key goes in through a private file, never through a command line
+    (umask 077; printf '%s' "$TS_AUTHKEY" > "$WORKDIR/ts-authkey")
+    pct push "$VMID" "$WORKDIR/ts-authkey" /root/ts-authkey --perms 0600
+fi
+unset TS_AUTHKEY
 pct exec "$VMID" -- bash /root/provision.sh
 ok "Container provisioned."
 
@@ -967,9 +1104,11 @@ SVC_FAILED=0
 # check LABEL COMMAND [TRIES] — run COMMAND in the container (every 2s) until it succeeds
 check() {
     local label="$1" cmd="$2" tries="${3:-1}" i
+    CHECK_OK=0
     for ((i = 0; i < tries; i++)); do
         if ct_exec "$cmd" >/dev/null 2>&1; then
             ok "$label"
+            CHECK_OK=1
             return 0
         fi
         sleep 2
@@ -1004,6 +1143,19 @@ if [[ "$GATEWAY_RESTARTS" =~ ^[0-9]+$ ]] && (( GATEWAY_RESTARTS > 0 )); then
 fi
 
 CT_STATUS=$(ct_exec "cat /etc/openclaw/status 2>/dev/null" || true)
+TS_STATE=$(sed -n 's/^tailscale=//p' <<<"$CT_STATUS")
+TS_DNS=$(sed -n 's/^tailscale_dns=//p' <<<"$CT_STATUS")
+if [[ "$TS_STATE" == "up" ]]; then
+    check "Tailscale is connected" "tailscale ip -4 >/dev/null" 5
+    # OpenClaw publishes the dashboard on :443 itself once the gateway is up; noVNC is on :8443
+    # shellcheck disable=SC2016  # the command runs (and expands) inside the container
+    check "Tailscale Serve publishes the dashboard (:443) and noVNC (:8443)" \
+        's=$(tailscale serve status --json); [[ "$s" == *:443* && "$s" == *:8443* ]]' 30
+    TS_DASH_OK=$CHECK_OK
+elif [[ "$ENABLE_TAILSCALE" == "1" ]]; then
+    warn "Tailscale is not fully set up (state: ${TS_STATE:-unknown}) — see the warnings above."
+    SVC_FAILED=1
+fi
 if [[ "$CT_STATUS" == *chrome=failed* ]]; then
     warn "Chrome could not start headless — its sandbox may not work in this container (see README → Troubleshooting)."
 fi
@@ -1022,6 +1174,15 @@ else
     TUNNEL_NOTE="first run: ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 ${CT_USER}@${CT_IP}"
 fi
 
+TAILNET_UP=0
+TS_DASH_OK="${TS_DASH_OK:-0}"
+[[ "$TS_STATE" == "up" && -n "$TS_DNS" ]] && TAILNET_UP=1
+if (( TAILNET_UP )); then
+    PRIMARY_NOVNC_URL="https://${TS_DNS}:8443/vnc.html"
+else
+    PRIMARY_NOVNC_URL="$NOVNC_URL"
+fi
+
 summary() {
     local rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo
@@ -1034,19 +1195,42 @@ summary() {
     kv "Container" "$VMID ($CT_HOSTNAME) · $CT_IP"
     kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (no sudo; root shell: pct enter $VMID)"
     echo
-    echo -e "  ${BOLD}${CYAN}Remote desktop${NC}"
-    kv "URL" "$NOVNC_URL"
-    kv "" "${DIM}${TUNNEL_NOTE}${NC}"
-    kv "VNC password" "${CYAN}${VNC_PASSWORD}${NC}"
-    echo
-    echo -e "  ${BOLD}${CYAN}OpenClaw dashboard${NC}  ${DIM}(loopback only)${NC}"
-    kv "URL" "http://localhost:18789/   ${DIM}or the Dashboard shortcut on the desktop${NC}"
-    kv "Auth token" "${CYAN}${AUTH_TOKEN}${NC}"
+    if (( TAILNET_UP )); then
+        echo -e "  ${BOLD}${CYAN}Over your tailnet (Tailscale)${NC}"
+        if (( TS_DASH_OK )); then
+            kv "Dashboard" "https://${TS_DNS}/"
+        else
+            kv "Dashboard" "${YELLOW}not published (see warnings); use the fallback below${NC}"
+        fi
+        kv "Remote desktop" "https://${TS_DNS}:8443/vnc.html"
+        kv "Auth token" "${CYAN}${AUTH_TOKEN}${NC}   ${DIM}(always required)${NC}"
+        kv "VNC password" "${CYAN}${VNC_PASSWORD}${NC}"
+        echo
+        echo -e "  ${BOLD}${CYAN}Without Tailscale${NC}  ${DIM}(fallback)${NC}"
+        kv "Remote desktop" "$NOVNC_URL"
+        kv "" "${DIM}${TUNNEL_NOTE}${NC}"
+        kv "Dashboard" "http://localhost:18789/   ${DIM}or the Dashboard shortcut on the desktop${NC}"
+    else
+        echo -e "  ${BOLD}${CYAN}Remote desktop${NC}"
+        kv "URL" "$NOVNC_URL"
+        kv "" "${DIM}${TUNNEL_NOTE}${NC}"
+        kv "VNC password" "${CYAN}${VNC_PASSWORD}${NC}"
+        echo
+        echo -e "  ${BOLD}${CYAN}OpenClaw dashboard${NC}  ${DIM}(loopback only)${NC}"
+        kv "URL" "http://localhost:18789/   ${DIM}or the Dashboard shortcut on the desktop${NC}"
+        kv "Auth token" "${CYAN}${AUTH_TOKEN}${NC}"
+    fi
     echo
     echo -e "  ${BOLD}${CYAN}Next steps${NC}"
-    echo "    1. Open the remote desktop URL and sign in with the VNC password"
+    echo "    1. Open ${PRIMARY_NOVNC_URL} and sign in with the VNC password"
     echo "    2. Double-click \"OpenClaw Setup Wizard\" to configure channels and skills"
     echo "    3. Add the Chrome extension from the Chrome Web Store (ID kcdjddhmeafeomebliikmbpblkmkfoig)"
+    if (( TAILNET_UP )); then
+        echo "    4. The first time a browser opens the tailnet dashboard, approve it from the container:"
+        echo -e "       ${DIM}ssh ${CT_USER}@${CT_IP} → openclaw devices list → openclaw devices approve <requestId>${NC}"
+        echo -e "       ${DIM}Tip: disable key expiry for this node in the Tailscale admin console; with an expired${NC}"
+        echo -e "       ${DIM}key the gateway will not start (undo with: openclaw config set gateway.tailscale.mode off).${NC}"
+    fi
     if [[ "$EXT_STATE" == "registered" ]]; then
         echo -e "       ${DIM}the OpenClaw native host is already registered; check with: openclaw browser extension status${NC}"
     else

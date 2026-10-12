@@ -569,10 +569,20 @@ as_user() { runuser -u "$CT_USER" -- env HOME="$USER_HOME" "$@"; }
 step "Updating packages and installing prerequisites"
 quiet apt-get update
 apt_install locales
-sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
-quiet locale-gen en_US.UTF-8
-update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+# Enable en_US.UTF-8, generate it, and only export it once it really exists (exporting a
+# missing locale makes bash/perl print "cannot change locale" warnings for every command)
+sed -i 's/^# *\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+grep -q '^en_US\.UTF-8 UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+quiet locale-gen
+AVAILABLE_LOCALES=$(locale -a)
+if [[ "$AVAILABLE_LOCALES" == *en_US.utf8* ]]; then
+    CT_LOCALE=en_US.UTF-8
+else
+    echo "WARNING: en_US.UTF-8 could not be generated; falling back to C.UTF-8" >&2
+    CT_LOCALE=C.UTF-8
+fi
+update-locale LANG="$CT_LOCALE"
+export LANG="$CT_LOCALE" LC_ALL="$CT_LOCALE"
 quiet apt-get upgrade -y "${APT_OPTS[@]}"
 apt_install curl ca-certificates gnupg git sudo openssh-server
 

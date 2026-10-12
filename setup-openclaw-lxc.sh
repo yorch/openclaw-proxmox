@@ -9,7 +9,8 @@
 # Every setting can be preset through the environment for unattended runs, e.g.:
 #   CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 CORES=6 ./setup-openclaw-lxc.sh
 # Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME BRIDGE
-#            TMPL_STORAGE ROOT_STORAGE ONBOOT
+#            TMPL_STORAGE ROOT_STORAGE ONBOOT PRIVILEGED NODE_MAJOR OPENCLAW_VERSION
+#            HOMEBREW_INSTALL_REF
 #
 
 set -euo pipefail
@@ -31,10 +32,12 @@ fatal() { err "$@"; exit 1; }
 # ─── Cleanup on failure ──────────────────────────────────────────────────────
 VMID="${VMID:-}"
 CT_CREATED=0
+WORKDIR=""
 
 cleanup() {
     local rc=$?
     trap - EXIT
+    [[ -z "$WORKDIR" ]] || rm -rf "$WORKDIR"
     if (( rc != 0 && CT_CREATED )); then
         err "Setup failed. Container $VMID was left in place for inspection."
         err "  Inspect:  pct enter $VMID"
@@ -44,9 +47,11 @@ cleanup() {
             read -rp "Destroy container $VMID now? [y/N]: " answer || true
             if [[ "$answer" =~ ^[Yy]$ ]]; then
                 pct stop "$VMID" >/dev/null 2>&1 || true
-                pct destroy "$VMID" --purge >/dev/null 2>&1 \
-                    && info "Container $VMID destroyed." \
-                    || err "Could not destroy container $VMID."
+                if pct destroy "$VMID" --purge >/dev/null 2>&1; then
+                    info "Container $VMID destroyed."
+                else
+                    err "Could not destroy container $VMID."
+                fi
             fi
         fi
     fi
@@ -78,8 +83,9 @@ ask() {
 
 require_int() { # require_int NAME MIN MAX
     local name="$1" min="$2" max="$3" value="${!1}"
-    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= min && value <= max )) \
-        || fatal "$name must be a whole number between $min and $max (got '$value')."
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < min || value > max )); then
+        fatal "$name must be a whole number between $min and $max (got '$value')."
+    fi
 }
 
 echo -e "${BOLD}╔═══════════════════════════════════════════════════╗${NC}"
@@ -89,7 +95,7 @@ echo
 
 if [[ -z "${CT_PASSWORD:-}" ]]; then
     [[ -t 0 ]] || fatal "No terminal available — set CT_PASSWORD in the environment."
-    read -rp "Container password: " -s CT_PASSWORD
+    read -rp "Password for the openclaw user (also VNC): " -s CT_PASSWORD
     echo
     read -rp "Confirm password: " -s CT_PASSWORD_CONFIRM
     echo
@@ -105,6 +111,9 @@ ask VNC_RES   "VNC resolution"   1920x1080
 CT_HOSTNAME="${CT_HOSTNAME:-openclaw}"
 BRIDGE="${BRIDGE:-vmbr0}"
 ONBOOT="${ONBOOT:-1}"
+# Unprivileged by default; PRIVILEGED=1 is an explicit opt-in
+[[ "${PRIVILEGED:-0}" =~ ^[01]$ ]] || fatal "PRIVILEGED must be 0 or 1."
+UNPRIVILEGED=$(( 1 - ${PRIVILEGED:-0} ))
 
 require_int DISK_SIZE 4 100000
 require_int MEMORY 1024 1000000
@@ -179,12 +188,12 @@ fi
 info "Creating LXC container $VMID..."
 pct create "$VMID" "${TMPL_STORAGE}:vztmpl/${TEMPLATE}" \
     --hostname "$CT_HOSTNAME" \
-    --password "$CT_PASSWORD" \
     --rootfs "${ROOT_STORAGE}:${DISK_SIZE}" \
     --memory "$MEMORY" \
     --cores "$CORES" \
     --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
-    --unprivileged 0 \
+    --unprivileged "$UNPRIVILEGED" \
+    --features nesting=1 \
     --onboot "$ONBOOT" \
     --start 0
 CT_CREATED=1
@@ -227,107 +236,155 @@ ct_exec "getent hosts deb.debian.org >/dev/null" 2>/dev/null \
     || fatal "Container cannot resolve deb.debian.org — check DNS and the network configuration."
 ok "Container has network access."
 
-# ─── Install packages inside the container ────────────────────────────────────
-info "Updating packages and installing prerequisites..."
-ct_exec "
-    export DEBIAN_FRONTEND=noninteractive
-
-    # Fix locale warnings
-    apt-get update && apt-get install -y locales 2>&1 | grep -v 'Failed to write'
-    sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
-    locale-gen en_US.UTF-8 >/dev/null 2>&1
-    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-    export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-
-    apt-get upgrade -y 2>&1 | grep -v 'Failed to write'
-    apt-get install -y curl ca-certificates gnupg git 2>&1 | grep -v 'Failed to write'
-"
-ok "Prerequisites installed."
-
-info "Installing Node.js 22..."
-ct_exec "
-    export DEBIAN_FRONTEND=noninteractive
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - 2>&1 | tail -3
-    apt-get install -y nodejs 2>&1 | grep -v 'Failed to write'
-"
-ok "Node.js installed."
-
-info "Installing Homebrew (required for OpenClaw skills)..."
-ct_exec "
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y build-essential procps file 2>&1 | grep -v -E 'Failed to write|Permission denied'
-
-    # Homebrew must be installed as a non-root user
-    useradd -m -s /bin/bash brewuser 2>/dev/null || true
-    echo 'brewuser ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/brewuser
-
-    # Install Homebrew as brewuser
-    su - brewuser -c 'NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"' 2>&1 | tail -5
-
-    # Make brew available system-wide for root
-    echo '[ -x /home/linuxbrew/.linuxbrew/bin/brew ] && eval \"\$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)\"' >> /root/.bashrc
-    ln -sf /home/linuxbrew/.linuxbrew/bin/brew /usr/local/bin/brew
-"
-ok "Homebrew installed."
-
-info "Installing OpenClaw..."
-ct_exec "npm install -g openclaw@latest 2>&1 | tail -5"
-ok "OpenClaw installed."
-
-info "Installing LXQt, TigerVNC, noVNC (this takes a few minutes)..."
-ct_exec "
-    export DEBIAN_FRONTEND=noninteractive
-    export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-    apt-get install -y lxqt openbox lxterminal tigervnc-standalone-server novnc websockify dbus-x11 fonts-noto-color-emoji 2>&1 \
-        | grep -v -E 'Failed to write|Failed to send reload|Permission denied|Cannot set LC_'
-"
-ok "Desktop environment installed."
-
-info "Installing Google Chrome..."
-ct_exec "
-    export DEBIAN_FRONTEND=noninteractive
-    curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb
-    apt-get install -y /tmp/chrome.deb 2>&1 | grep -v -E 'Failed to write|Permission denied'
-    rm -f /tmp/chrome.deb
-"
-ok "Google Chrome installed."
-
-# ─── Configure OpenClaw ──────────────────────────────────────────────────────
-info "Configuring OpenClaw..."
+# ─── Build the in-container provisioning payload ─────────────────────────────
+# Everything inside the container runs as ONE strict script (set -euo pipefail) that is
+# copied in with `pct push`. Secrets travel in a 0600 env file, never on a command line.
 AUTH_TOKEN=$(openssl rand -hex 16)
+CT_USER="openclaw"
 
-ct_exec "
-    openclaw config set gateway.mode local
-    openclaw config set gateway.bind lan
-    openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true
-    openclaw config set gateway.auth.token '${AUTH_TOKEN}'
-"
-ok "OpenClaw configured (token: $AUTH_TOKEN)."
+WORKDIR=$(mktemp -d)
+chmod 700 "$WORKDIR"
 
-info "Installing OpenClaw browser extension..."
-ct_exec "openclaw browser extension install 2>&1 | tail -5 || true"
-ok "OpenClaw browser extension installed."
+{
+    printf 'CT_USER=%q\n'              "$CT_USER"
+    printf 'CT_PASSWORD=%q\n'          "$CT_PASSWORD"
+    printf 'AUTH_TOKEN=%q\n'           "$AUTH_TOKEN"
+    printf 'VNC_RES=%q\n'              "$VNC_RES"
+    printf 'NODE_MAJOR=%q\n'           "${NODE_MAJOR:-22}"
+    printf 'OPENCLAW_VERSION=%q\n'     "${OPENCLAW_VERSION:-latest}"
+    printf 'HOMEBREW_INSTALL_REF=%q\n' "${HOMEBREW_INSTALL_REF:-HEAD}"
+} > "$WORKDIR/provision.env"
 
-# ─── Configure VNC ───────────────────────────────────────────────────────────
-info "Configuring VNC..."
-ct_exec "
-    mkdir -p /root/.config/tigervnc
-    echo '${CT_PASSWORD}' | vncpasswd -f > /root/.config/tigervnc/passwd
-    chmod 600 /root/.config/tigervnc/passwd
-"
+cat > "$WORKDIR/provision.sh" <<'PROVISION'
+#!/usr/bin/env bash
+# Runs inside the container as root. Any failing command aborts the whole setup.
+set -euo pipefail
 
-ct_exec "cat > /root/.config/tigervnc/xstartup << 'XSTARTUP'
+# shellcheck disable=SC1091
+source /root/provision.env
+trap 'rm -f /root/provision.env /root/provision.sh /etc/sudoers.d/openclaw-provision' EXIT
+
+export DEBIAN_FRONTEND=noninteractive
+USER_HOME="/home/${CT_USER}"
+
+step() { echo "  → $*"; }
+
+# Run a command silently; replay its output only if it fails.
+quiet() {
+    local log
+    log=$(mktemp)
+    if ! "$@" >"$log" 2>&1; then
+        echo "Command failed: $*" >&2
+        tail -n 40 "$log" >&2
+        rm -f "$log"
+        return 1
+    fi
+    rm -f "$log"
+}
+APT_OPTS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+apt_install() { quiet apt-get install -y "${APT_OPTS[@]}" "$@"; }
+as_user() { runuser -u "$CT_USER" -- env HOME="$USER_HOME" "$@"; }
+
+# ── Base system ──────────────────────────────────────────────────────────────
+step "Updating packages and installing prerequisites"
+quiet apt-get update
+apt_install locales
+sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
+quiet locale-gen en_US.UTF-8
+update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+quiet apt-get upgrade -y "${APT_OPTS[@]}"
+apt_install curl ca-certificates gnupg git sudo openssh-server
+
+# ── Unprivileged login user (runs the desktop, Chrome and the gateway) ───────
+step "Creating user ${CT_USER}"
+id "$CT_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$CT_USER"
+chpasswd <<<"${CT_USER}:${CT_PASSWORD}"
+systemctl enable --now ssh >/dev/null 2>&1
+
+# ── Node.js (signed NodeSource apt repository, no piped installer) ───────────
+step "Installing Node.js ${NODE_MAJOR}"
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list
+quiet apt-get update
+apt_install nodejs
+[[ "$(node -p 'process.versions.node.split(".")[0]')" == "$NODE_MAJOR" ]] \
+    || { echo "Node.js ${NODE_MAJOR} was not installed" >&2; exit 1; }
+
+# ── Homebrew (needed by OpenClaw skills; installed as the login user) ────────
+step "Installing Homebrew"
+apt_install build-essential procps file
+# Homebrew's installer needs sudo once; the grant is removed again right after.
+echo "${CT_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/openclaw-provision
+chmod 440 /etc/sudoers.d/openclaw-provision
+curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/${HOMEBREW_INSTALL_REF}/install.sh" -o /tmp/brew-install.sh
+chmod 755 /tmp/brew-install.sh
+quiet as_user env NONINTERACTIVE=1 /bin/bash /tmp/brew-install.sh
+rm -f /tmp/brew-install.sh /etc/sudoers.d/openclaw-provision
+BREW=/home/linuxbrew/.linuxbrew/bin/brew
+[[ -x "$BREW" ]] || { echo "Homebrew was not installed" >&2; exit 1; }
+ln -sf "$BREW" /usr/local/bin/brew
+grep -qs 'brew shellenv' "$USER_HOME/.bashrc" \
+    || echo "eval \"\$($BREW shellenv)\"" >> "$USER_HOME/.bashrc"
+
+# ── OpenClaw ─────────────────────────────────────────────────────────────────
+step "Installing OpenClaw (${OPENCLAW_VERSION})"
+quiet npm install -g "openclaw@${OPENCLAW_VERSION}"
+OPENCLAW_BIN=$(command -v openclaw) || { echo "openclaw binary not found after install" >&2; exit 1; }
+
+# ── Desktop, VNC, noVNC ──────────────────────────────────────────────────────
+step "Installing LXQt, TigerVNC and noVNC (this takes a few minutes)"
+apt_install lxqt openbox lxterminal tigervnc-standalone-server novnc websockify dbus-x11 \
+    fonts-noto-color-emoji xdg-utils
+WEBSOCKIFY_BIN=$(command -v websockify) || { echo "websockify not found after install" >&2; exit 1; }
+
+# ── Google Chrome ────────────────────────────────────────────────────────────
+step "Installing Google Chrome"
+curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb
+apt_install /tmp/chrome.deb
+rm -f /tmp/chrome.deb
+
+# ── OpenClaw configuration ───────────────────────────────────────────────────
+step "Configuring OpenClaw"
+as_user openclaw config set gateway.mode local
+as_user openclaw config set gateway.bind lan
+as_user openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true
+as_user openclaw config set gateway.auth.token "$AUTH_TOKEN"
+
+step "Installing the OpenClaw browser extension"
+if as_user openclaw browser extension install > "$USER_HOME/openclaw-extension.txt" 2>&1; then
+    chown "$CT_USER:$CT_USER" "$USER_HOME/openclaw-extension.txt"
+else
+    echo "WARNING: 'openclaw browser extension install' failed; see ${USER_HOME}/openclaw-extension.txt" >&2
+fi
+
+# ── VNC ──────────────────────────────────────────────────────────────────────
+step "Configuring VNC"
+install -d -o "$CT_USER" -g "$CT_USER" -m 0700 "$USER_HOME/.config" "$USER_HOME/.config/tigervnc"
+printf '%s\n' "$CT_PASSWORD" | vncpasswd -f > "$USER_HOME/.config/tigervnc/passwd"
+chmod 600 "$USER_HOME/.config/tigervnc/passwd"
+
+cat > "$USER_HOME/.config/tigervnc/xstartup" <<'XSTARTUP'
 #!/bin/bash
 unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
 exec dbus-launch --exit-with-session startlxqt
 XSTARTUP
-chmod +x /root/.config/tigervnc/xstartup"
+chmod +x "$USER_HOME/.config/tigervnc/xstartup"
 
-# Configure lxterminal with dark theme
-ct_exec "
-    mkdir -p /root/.config/lxterminal
-    cat > /root/.config/lxterminal/lxterminal.conf << 'CONF'
+# noVNC: scale the remote desktop to the browser window by default. defaults.json is
+# read by noVNC at runtime, so unlike patching ui.js it survives package upgrades.
+echo '{ "resize": "scale" }' > /usr/share/novnc/defaults.json
+
+# ── Desktop configuration ────────────────────────────────────────────────────
+step "Configuring the desktop"
+install -d "$USER_HOME/.config/lxterminal" "$USER_HOME/.config/autostart" \
+    "$USER_HOME/.config/lxqt" "$USER_HOME/Desktop"
+
+cat > "$USER_HOME/.config/lxterminal/lxterminal.conf" <<'CONF'
 [general]
 fontname=Monospace 12
 bgcolor=#1e1e2e
@@ -350,63 +407,22 @@ palette_color_14=#94e2d5
 palette_color_15=#a6adc8
 scrollback=10000
 CONF
-"
 
-# Set noVNC scaling to auto by default
-ct_exec "sed -i \"s/UI.initSetting('resize', 'off')/UI.initSetting('resize', 'scale')/\" /usr/share/novnc/app/ui.js"
-ok "VNC configured (auto-scaling enabled)."
-
-# ─── Disable LXC-incompatible LXQt components ───────────────────────────────
-info "Disabling LXC-incompatible LXQt components..."
-ct_exec "
-    mkdir -p /root/.config/autostart
-    # Disable power management (no hardware in LXC)
-    cat > /root/.config/autostart/lxqt-powermanagement.desktop << 'NOAUTO'
+# LXC has no power hardware and a VNC session needs no screen saver
+cat > "$USER_HOME/.config/autostart/lxqt-powermanagement.desktop" <<'NOAUTO'
 [Desktop Entry]
 Type=Application
 Name=LXQt Power Management
 Hidden=true
 NOAUTO
-    # Disable screen saver (not needed in VNC)
-    cat > /root/.config/autostart/lxqt-xscreensaver-autostart.desktop << 'NOAUTO'
+cat > "$USER_HOME/.config/autostart/lxqt-xscreensaver-autostart.desktop" <<'NOAUTO'
 [Desktop Entry]
 Type=Application
 Name=LXQt Screen Saver
 Hidden=true
 NOAUTO
-"
-ok "LXC-incompatible components disabled."
 
-# ─── Configure Google Chrome for root user ───────────────────────────────────
-info "Configuring Google Chrome..."
-ct_exec "
-    # Chrome requires --no-sandbox when running as root
-    sed -i 's|Exec=/usr/bin/google-chrome-stable|Exec=/usr/bin/google-chrome-stable --no-sandbox|g' /usr/share/applications/google-chrome.desktop
-
-    mkdir -p /root/Desktop
-    cp /usr/share/applications/google-chrome.desktop /root/Desktop/
-    chmod +x /root/Desktop/google-chrome.desktop
-
-    # Wrapper so CLI calls also get --no-sandbox
-    cat > /usr/local/bin/google-chrome << 'WRAPPER'
-#!/bin/bash
-exec /usr/bin/google-chrome-stable --no-sandbox \"\$@\"
-WRAPPER
-    chmod +x /usr/local/bin/google-chrome
-
-    update-alternatives --set x-www-browser /usr/bin/google-chrome-stable 2>/dev/null || true
-    update-alternatives --set gnome-www-browser /usr/bin/google-chrome-stable 2>/dev/null || true
-    xdg-mime default google-chrome.desktop x-scheme-handler/http 2>/dev/null || true
-    xdg-mime default google-chrome.desktop x-scheme-handler/https 2>/dev/null || true
-    xdg-mime default google-chrome.desktop text/html 2>/dev/null || true
-"
-ok "Google Chrome configured."
-
-# ─── Configure LXQt default terminal ─────────────────────────────────────────
-info "Setting lxterminal as default terminal..."
-ct_exec "
-    mkdir -p /root/.config/lxqt
-    cat > /root/.config/lxqt/session.conf << 'CONF'
+cat > "$USER_HOME/.config/lxqt/session.conf" <<'CONF'
 [General]
 __userfile__=true
 
@@ -416,14 +432,53 @@ TERM=xterm-256color
 [Preferred Applications]
 terminal_emulator=lxterminal
 CONF
-"
-ok "Default terminal configured."
 
-# ─── Create desktop shortcuts ────────────────────────────────────────────────
-info "Creating desktop shortcuts..."
+# ── Google Chrome as the default browser ─────────────────────────────────────
+# Chrome runs as the unprivileged user with its sandbox ENABLED. If the sandbox cannot
+# start in your environment, put "--no-sandbox" in /etc/openclaw/chrome-flags (not advised).
+step "Configuring Google Chrome"
+install -d /etc/openclaw
+touch /etc/openclaw/chrome-flags
 
-# Terminal shortcut
-ct_exec "cat > /root/Desktop/terminal.desktop << 'SHORTCUT'
+cat > /usr/local/bin/google-chrome <<'WRAPPER'
+#!/bin/bash
+# Launches Chrome with any extra flags listed (one line) in /etc/openclaw/chrome-flags
+flags=()
+if [[ -r /etc/openclaw/chrome-flags ]]; then
+    read -r -a flags < /etc/openclaw/chrome-flags || true
+fi
+exec /usr/bin/google-chrome-stable "${flags[@]}" "$@"
+WRAPPER
+chmod 755 /usr/local/bin/google-chrome
+
+# Own .desktop entry instead of editing the package's file, so upgrades cannot undo it
+install -d /usr/local/share/applications
+cat > /usr/local/share/applications/openclaw-chrome.desktop <<'DESKTOP'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Chrome
+Comment=Access the Internet
+Exec=/usr/local/bin/google-chrome %U
+Icon=google-chrome
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+DESKTOP
+cp /usr/local/share/applications/openclaw-chrome.desktop "$USER_HOME/Desktop/google-chrome.desktop"
+
+update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/google-chrome 250
+update-alternatives --set x-www-browser /usr/local/bin/google-chrome
+update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/google-chrome 250
+update-alternatives --set gnome-www-browser /usr/local/bin/google-chrome
+for mime in x-scheme-handler/http x-scheme-handler/https text/html; do
+    as_user xdg-mime default openclaw-chrome.desktop "$mime"
+done
+
+# ── Desktop shortcuts ────────────────────────────────────────────────────────
+step "Creating desktop shortcuts"
+cat > "$USER_HOME/Desktop/terminal.desktop" <<'SHORTCUT'
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -435,10 +490,8 @@ Terminal=false
 Categories=System;TerminalEmulator;
 StartupNotify=true
 SHORTCUT
-chmod +x /root/Desktop/terminal.desktop"
 
-# OpenClaw Onboarding wizard (runs in terminal)
-ct_exec "cat > /root/Desktop/openclaw-onboard.desktop << 'SHORTCUT'
+cat > "$USER_HOME/Desktop/openclaw-onboard.desktop" <<'SHORTCUT'
 [Desktop Entry]
 Version=1.0
 Type=Application
@@ -450,54 +503,57 @@ Terminal=false
 Categories=Utility;
 StartupNotify=true
 SHORTCUT
-chmod +x /root/Desktop/openclaw-onboard.desktop"
 
-# OpenClaw Dashboard (opens in Chrome with token)
-ct_exec "cat > /root/Desktop/openclaw-dashboard.desktop << SHORTCUT
+# Opens the dashboard with the token pre-filled; the file is private to the user
+cat > "$USER_HOME/Desktop/openclaw-dashboard.desktop" <<SHORTCUT
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=OpenClaw Dashboard
 Comment=Open the OpenClaw Control UI in Google Chrome
-Exec=google-chrome-stable --no-sandbox http://127.0.0.1:18789/#token=${AUTH_TOKEN}
+Exec=/usr/local/bin/google-chrome http://127.0.0.1:18789/#token=${AUTH_TOKEN}
 Icon=web-browser
 Terminal=false
 Categories=Network;WebBrowser;
 StartupNotify=true
 SHORTCUT
-chmod +x /root/Desktop/openclaw-dashboard.desktop"
 
-ok "Desktop shortcuts created."
+chmod 755 "$USER_HOME"/Desktop/*.desktop
+chmod 700 "$USER_HOME/Desktop/openclaw-dashboard.desktop"
+chown -R "$CT_USER:$CT_USER" "$USER_HOME"
 
-# ─── Create systemd services ─────────────────────────────────────────────────
-info "Creating systemd services..."
-
-ct_exec "cat > /etc/systemd/system/openclaw-gateway.service << 'SVC'
+# ── systemd services ─────────────────────────────────────────────────────────
+step "Creating systemd services"
+cat > /etc/systemd/system/openclaw-gateway.service <<SVC
 [Unit]
 Description=OpenClaw Gateway
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/openclaw gateway run --bind lan --auth token
+User=${CT_USER}
+Environment=HOME=${USER_HOME}
+Environment=NODE_ENV=production
+WorkingDirectory=${USER_HOME}
+ExecStart=${OPENCLAW_BIN} gateway run --bind lan --auth token
 Restart=always
 RestartSec=5
-Environment=NODE_ENV=production
-WorkingDirectory=/root
 
 [Install]
 WantedBy=multi-user.target
-SVC"
+SVC
 
-ct_exec "cat > /etc/systemd/system/vncserver.service << SVC
+cat > /etc/systemd/system/vncserver.service <<SVC
 [Unit]
 Description=TigerVNC Server
 After=network.target
 
 [Service]
 Type=forking
-Environment=HOME=/root
-ExecStartPre=/bin/sh -c \"/usr/bin/vncserver -kill :1 > /dev/null 2>&1 || :\"
+User=${CT_USER}
+Environment=HOME=${USER_HOME}
+ExecStartPre=-/usr/bin/vncserver -kill :1
 ExecStart=/usr/bin/vncserver :1 -geometry ${VNC_RES} -depth 24 -localhost yes
 ExecStop=/usr/bin/vncserver -kill :1
 Restart=on-failure
@@ -505,9 +561,9 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-SVC"
+SVC
 
-ct_exec "cat > /etc/systemd/system/novnc.service << 'SVC'
+cat > /etc/systemd/system/novnc.service <<SVC
 [Unit]
 Description=noVNC WebSocket Proxy
 After=vncserver.service
@@ -515,21 +571,25 @@ Requires=vncserver.service
 
 [Service]
 Type=simple
-ExecStart=/bin/websockify --web=/usr/share/novnc/ 6080 localhost:5901
+User=${CT_USER}
+ExecStart=${WEBSOCKIFY_BIN} --web=/usr/share/novnc/ 6080 localhost:5901
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-SVC"
+SVC
 
-ct_exec "
-    systemctl daemon-reload
-    systemctl enable --now openclaw-gateway.service
-    systemctl enable --now vncserver.service
-    systemctl enable --now novnc.service
-"
-ok "All services enabled and started."
+systemctl daemon-reload
+systemctl enable --now openclaw-gateway.service vncserver.service novnc.service
+PROVISION
+
+# ─── Provision the container ─────────────────────────────────────────────────
+info "Provisioning the container (several minutes — packages, desktop, Chrome)..."
+pct push "$VMID" "$WORKDIR/provision.env" /root/provision.env --perms 0600
+pct push "$VMID" "$WORKDIR/provision.sh"  /root/provision.sh  --perms 0700
+pct exec "$VMID" -- bash /root/provision.sh
+ok "Container provisioned."
 
 sleep 3
 
@@ -544,7 +604,9 @@ for svc in openclaw-gateway vncserver novnc; do
 done
 
 # Re-detect IP in case it changed
-CT_IP=$(ct_exec "hostname -I 2>/dev/null" | awk '{print $1}' || echo "unknown")
+CT_IP=$(ct_exec "hostname -I 2>/dev/null" | awk '{print $1}' || true)
+CT_IP="${CT_IP:-unknown}"
+EXT_INFO=$(ct_exec "cat /home/${CT_USER}/openclaw-extension.txt 2>/dev/null | tail -n 5" || true)
 
 # ─── Print connection info ────────────────────────────────────────────────────
 echo
@@ -554,6 +616,7 @@ echo -e "${BOLD}╚════════════════════�
 echo
 echo -e "  ${BOLD}Container ID:${NC}  $VMID"
 echo -e "  ${BOLD}Container IP:${NC}  $CT_IP"
+echo -e "  ${BOLD}Login user:${NC}    $CT_USER (password: the one you entered)"
 echo
 echo -e "  ${BOLD}OpenClaw Dashboard:${NC}"
 echo -e "    http://${CT_IP}:18789/"
@@ -561,14 +624,18 @@ echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
 echo
 echo -e "  ${BOLD}noVNC (remote desktop):${NC}"
 echo -e "    http://${CT_IP}:6080/vnc.html"
-echo -e "    VNC password: (same as container password)"
+echo -e "    VNC password: first 8 characters of the container password"
 echo
 echo -e "  ${BOLD}Browser Extension:${NC}"
 echo -e "    Open Chrome → chrome://extensions → Enable Developer Mode"
-echo -e "    Click 'Load unpacked' and select the OpenClaw extension directory"
+echo -e "    Click 'Load unpacked' and select the OpenClaw extension directory."
+if [[ -n "$EXT_INFO" ]]; then
+    echo -e "    Output of 'openclaw browser extension install':"
+    while IFS= read -r line; do echo "      $line"; done <<<"$EXT_INFO"
+fi
 echo
 echo -e "  ${BOLD}SSH:${NC}"
-echo -e "    ssh root@${CT_IP}"
+echo -e "    ssh ${CT_USER}@${CT_IP}   (root SSH login is disabled; use 'pct enter $VMID' for a root shell)"
 echo
 echo -e "  ${BOLD}Manage container:${NC}"
 echo -e "    pct enter $VMID"

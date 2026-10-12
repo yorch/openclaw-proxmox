@@ -39,6 +39,8 @@ cleanup() {
     trap - EXIT
     [[ -z "$WORKDIR" ]] || rm -rf "$WORKDIR"
     if (( rc != 0 && CT_CREATED )); then
+        # Never leave the secrets file behind in a half-provisioned container
+        pct exec "$VMID" -- rm -f /root/provision.env /root/provision.sh >/dev/null 2>&1 || true
         err "Setup failed. Container $VMID was left in place for inspection."
         err "  Inspect:  pct enter $VMID"
         err "  Remove:   pct stop $VMID; pct destroy $VMID --purge"
@@ -83,7 +85,7 @@ ask() {
 
 require_int() { # require_int NAME MIN MAX
     local name="$1" min="$2" max="$3" value="${!1}"
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < min || value > max )); then
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( 10#$value < min || 10#$value > max )); then
         fatal "$name must be a whole number between $min and $max (got '$value')."
     fi
 }
@@ -108,7 +110,7 @@ ask DISK_SIZE "Disk size in GB"  32
 ask MEMORY    "Memory in MB"     4096
 ask CORES     "CPU cores"        4
 ask VNC_RES   "VNC resolution"   1920x1080
-ask EXPOSE_LAN "Expose noVNC (HTTPS) and the gateway on the LAN? 1=yes 0=no (loopback only, use an SSH tunnel)" 0
+ask EXPOSE_LAN "Expose noVNC on the LAN over HTTPS? 1=yes 0=no (loopback only, use an SSH tunnel)" 0
 CT_HOSTNAME="${CT_HOSTNAME:-openclaw}"
 BRIDGE="${BRIDGE:-vmbr0}"
 ONBOOT="${ONBOOT:-1}"
@@ -119,6 +121,7 @@ UNPRIVILEGED=$(( 1 - ${PRIVILEGED:-0} ))
 require_int DISK_SIZE 4 100000
 require_int MEMORY 1024 1000000
 require_int CORES 1 512
+DISK_SIZE=$((10#$DISK_SIZE)); MEMORY=$((10#$MEMORY)); CORES=$((10#$CORES))
 [[ "$VNC_RES" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || fatal "VNC resolution must look like 1920x1080 (got '$VNC_RES')."
 [[ "$CT_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fatal "Invalid hostname '$CT_HOSTNAME'."
 [[ "$BRIDGE" =~ ^[a-zA-Z0-9_.-]+$ ]] || fatal "Invalid bridge name '$BRIDGE'."
@@ -169,6 +172,12 @@ elif stores:
 ok "Template storage: $TMPL_STORAGE"
 ok "Rootfs storage:   $ROOT_STORAGE"
 
+# Debian 13 templates need a recent pve-container (reported fixed in 6.0.10 on PVE 9)
+PVE_CONTAINER_VERSION=$(dpkg-query -W -f='${Version}' pve-container 2>/dev/null || true)
+if [[ -n "$PVE_CONTAINER_VERSION" ]] && dpkg --compare-versions "$PVE_CONTAINER_VERSION" lt 6.0.10; then
+    warn "pve-container $PVE_CONTAINER_VERSION may not support Debian 13 containers — if 'pct create' fails, run 'apt update && apt full-upgrade'."
+fi
+
 # ─── Download Debian 13 template ─────────────────────────────────────────────
 info "Checking for Debian 13 template..."
 pveam update >/dev/null 2>&1 || warn "pveam update failed — using the cached template index."
@@ -210,6 +219,11 @@ ct_exec() {
     pct exec "$VMID" -- bash -c "$1"
 }
 
+# First IPv4 address of the container (ignores IPv6 SLAAC addresses)
+ct_ip() {
+    ct_exec "ip -4 -o addr show dev eth0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n 1" || true
+}
+
 info "Waiting for container to boot..."
 for _ in $(seq 1 30); do
     ct_exec "true" >/dev/null 2>&1 && break
@@ -221,9 +235,8 @@ ct_exec "true" >/dev/null 2>&1 || fatal "Container did not become reachable."
 info "Waiting for DHCP lease (up to 60s)..."
 CT_IP=""
 for _ in $(seq 1 60); do
-    CT_IP=$(ct_exec "hostname -I 2>/dev/null" | awk '{print $1}' || true)
-    [[ -n "$CT_IP" && "$CT_IP" != "127.0.0.1" ]] && break
-    CT_IP=""
+    CT_IP=$(ct_ip)
+    [[ -n "$CT_IP" ]] && break
     sleep 1
 done
 [[ -n "$CT_IP" ]] || fatal "Container got no IP address. Check that bridge '$BRIDGE' has a DHCP server."
@@ -273,6 +286,7 @@ trap 'rm -f /root/provision.env /root/provision.sh /etc/sudoers.d/openclaw-provi
 
 export DEBIAN_FRONTEND=noninteractive
 USER_HOME="/home/${CT_USER}"
+cd /   # pct exec inherits the host's cwd, which the unprivileged user cannot read
 
 step() { echo "  → $*"; }
 
@@ -333,7 +347,6 @@ quiet as_user env NONINTERACTIVE=1 /bin/bash /tmp/brew-install.sh
 rm -f /tmp/brew-install.sh /etc/sudoers.d/openclaw-provision
 BREW=/home/linuxbrew/.linuxbrew/bin/brew
 [[ -x "$BREW" ]] || { echo "Homebrew was not installed" >&2; exit 1; }
-ln -sf "$BREW" /usr/local/bin/brew
 grep -qs 'brew shellenv' "$USER_HOME/.bashrc" \
     || echo "eval \"\$($BREW shellenv)\"" >> "$USER_HOME/.bashrc"
 
@@ -357,13 +370,9 @@ rm -f /tmp/chrome.deb
 # ── OpenClaw configuration ───────────────────────────────────────────────────
 step "Configuring OpenClaw"
 as_user openclaw config set gateway.mode local
-if [[ "$EXPOSE_LAN" == "1" ]]; then
-    GATEWAY_BIND=lan
-    # Needed so the Control UI accepts requests addressed to the container's LAN IP
-    as_user openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true
-else
-    GATEWAY_BIND=loopback
-fi
+# The Control UI needs a secure context (HTTPS or localhost) for its device identity, so
+# the gateway stays on loopback even with EXPOSE_LAN=1; reach it from the desktop or a tunnel.
+GATEWAY_BIND=loopback
 as_user openclaw config set gateway.bind "$GATEWAY_BIND"
 as_user openclaw config set gateway.auth.token "$AUTH_TOKEN"
 
@@ -390,6 +399,10 @@ chmod +x "$USER_HOME/.config/tigervnc/xstartup"
 
 # noVNC: scale the remote desktop to the browser window by default. defaults.json is
 # read by noVNC at runtime, so unlike patching ui.js it survives package upgrades.
+# The package owns defaults.json, so divert it to keep our copy across upgrades.
+if [[ -z "$(dpkg-divert --list /usr/share/novnc/defaults.json)" ]]; then
+    dpkg-divert --local --rename --add /usr/share/novnc/defaults.json >/dev/null
+fi
 echo '{ "resize": "scale" }' > /usr/share/novnc/defaults.json
 
 # ── noVNC listener: loopback-only unless exposure was requested, then HTTPS ──
@@ -400,7 +413,7 @@ if [[ "$EXPOSE_LAN" == "1" ]]; then
         -keyout /etc/openclaw/novnc.key -out /etc/openclaw/novnc.crt 2>/dev/null
     chown "$CT_USER:$CT_USER" /etc/openclaw/novnc.key /etc/openclaw/novnc.crt
     chmod 600 /etc/openclaw/novnc.key
-    NOVNC_ARGS="--cert=/etc/openclaw/novnc.crt --key=/etc/openclaw/novnc.key 0.0.0.0:6080"
+    NOVNC_ARGS="--ssl-only --cert=/etc/openclaw/novnc.crt --key=/etc/openclaw/novnc.key 0.0.0.0:6080"
 else
     NOVNC_ARGS="127.0.0.1:6080"
 fi
@@ -537,7 +550,7 @@ Version=1.0
 Type=Application
 Name=OpenClaw Dashboard
 Comment=Open the OpenClaw Control UI in Google Chrome
-Exec=/usr/local/bin/google-chrome http://127.0.0.1:18789/#token=${AUTH_TOKEN}
+Exec=/usr/local/bin/google-chrome "http://127.0.0.1:18789/#token=${AUTH_TOKEN}"
 Icon=web-browser
 Terminal=false
 Categories=Network;WebBrowser;
@@ -598,7 +611,7 @@ Requires=vncserver.service
 [Service]
 Type=simple
 User=${CT_USER}
-ExecStart=${WEBSOCKIFY_BIN} --web=/usr/share/novnc/ ${NOVNC_ARGS} localhost:5901
+ExecStart=${WEBSOCKIFY_BIN} --web=/usr/share/novnc/ ${NOVNC_ARGS} 127.0.0.1:5901
 Restart=on-failure
 RestartSec=5
 
@@ -607,7 +620,10 @@ WantedBy=multi-user.target
 SVC
 
 systemctl daemon-reload
-systemctl enable --now openclaw-gateway.service vncserver.service novnc.service
+systemctl enable openclaw-gateway.service vncserver.service novnc.service >/dev/null 2>&1
+# A service that fails to start is reported by the host's verification step, not fatal here
+systemctl start openclaw-gateway.service vncserver.service novnc.service \
+    || echo "WARNING: at least one service failed to start (see systemctl status)" >&2
 PROVISION
 
 # ─── Provision the container ─────────────────────────────────────────────────
@@ -630,7 +646,7 @@ for svc in openclaw-gateway vncserver novnc; do
 done
 
 # Re-detect IP in case it changed
-CT_IP=$(ct_exec "hostname -I 2>/dev/null" | awk '{print $1}' || true)
+CT_IP=$(ct_ip)
 CT_IP="${CT_IP:-unknown}"
 EXT_INFO=$(ct_exec "cat /home/${CT_USER}/openclaw-extension.txt 2>/dev/null | tail -n 5" || true)
 
@@ -642,31 +658,22 @@ echo -e "${BOLD}╚════════════════════�
 echo
 echo -e "  ${BOLD}Container ID:${NC}  $VMID"
 echo -e "  ${BOLD}Container IP:${NC}  $CT_IP"
-echo -e "  ${BOLD}Login user:${NC}    $CT_USER (SSH / sudo password: the one you entered)"
+echo -e "  ${BOLD}Login user:${NC}    $CT_USER (SSH password: the one you entered; no sudo — use pct enter for root)"
 echo
+echo -e "  ${BOLD}noVNC (remote desktop):${NC}"
 if [[ "$EXPOSE_LAN" == "1" ]]; then
-    echo -e "  ${BOLD}OpenClaw Dashboard:${NC}"
-    echo -e "    http://${CT_IP}:18789/   (plain HTTP — trusted networks only)"
-    echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
-    echo
-    echo -e "  ${BOLD}noVNC (remote desktop):${NC}"
     echo -e "    https://${CT_IP}:6080/vnc.html   (self-signed certificate: accept the browser warning)"
-    echo -e "    VNC password: ${CYAN}${VNC_PASSWORD}${NC}"
 else
-    echo -e "  ${BOLD}Services listen on the container's loopback only.${NC} From your computer:"
-    echo -e "    ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 ${CT_USER}@${CT_IP}"
-    echo
-    echo -e "  ${BOLD}noVNC (remote desktop):${NC}  http://localhost:6080/vnc.html"
-    echo -e "    VNC password: ${CYAN}${VNC_PASSWORD}${NC}"
-    echo
-    echo -e "  ${BOLD}OpenClaw Dashboard:${NC}  http://localhost:18789/"
-    echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
-    echo -e "    (inside the remote desktop, the Dashboard shortcut opens it with the token filled in)"
+    echo -e "    http://localhost:6080/vnc.html   (after: ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 ${CT_USER}@${CT_IP})"
 fi
+echo -e "    VNC password: ${CYAN}${VNC_PASSWORD}${NC}"
+echo
+echo -e "  ${BOLD}OpenClaw Dashboard${NC} (loopback only — use the desktop shortcut or the tunnel above):"
+echo -e "    http://localhost:18789/"
+echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
 echo
 echo -e "  ${BOLD}Browser Extension:${NC}"
-echo -e "    Open Chrome → chrome://extensions → Enable Developer Mode"
-echo -e "    Click 'Load unpacked' and select the OpenClaw extension directory."
+echo -e "    Follow the output of 'openclaw browser extension install' (saved to ~/openclaw-extension.txt)."
 if [[ -n "$EXT_INFO" ]]; then
     echo -e "    Output of 'openclaw browser extension install':"
     while IFS= read -r line; do echo "      $line"; done <<<"$EXT_INFO"

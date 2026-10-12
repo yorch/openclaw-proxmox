@@ -102,14 +102,29 @@ CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 EXPOSE_LAN=1 ./setup-openclaw-lxc.
 | `ONBOOT` | 1 | Start the container when the host boots |
 | `VMID` | next free (prompted) | Container ID; checked against existing guests |
 | `CT_HOSTNAME` | openclaw | Container hostname |
-| `BRIDGE` | vmbr0 | Network bridge (DHCP) |
+| `BRIDGE` | prompted menu (default `vmbr0`) | Network bridge; the menu lists the bridges found on the host |
+| `IP_ADDRESS` | dhcp | `dhcp`, or a static IPv4 address in CIDR form such as `192.168.1.50/24` |
+| `GATEWAY` | first host of the network | Required for a static address; must be inside its network |
+| `NAMESERVER` | host resolver | DNS server(s), space separated (asked for static addresses) |
+| `SEARCHDOMAIN` | *(none)* | DNS search domain |
+| `VLAN_TAG` | *(none)* | VLAN tag for the container's NIC (1–4094) |
+| `MTU` | *(bridge default)* | MTU for the container's NIC |
+| `SWAP` | 512 | Swap in MB |
+| `TIMEZONE` | host | Container timezone, e.g. `Europe/Berlin`, or `host` to follow the Proxmox host |
 | `ROOT_STORAGE` | prompted menu | Storage for the container disk; the menu lists enabled storages on the node with free space (default `local-lvm`) |
 | `TMPL_STORAGE` | auto | Storage for the Debian template (default `local`) |
 | `OPENCLAW_VERSION` | latest | npm version of OpenClaw to install (releases before 2026.9.3 have known security advisories; releases from 2026.9 need Node 24+) |
 | `NODE_MAJOR` | 24 | Node.js major version (current OpenClaw needs Node ≥ 24.16 <25 or ≥ 26.1) |
 | `HOMEBREW_INSTALL_REF` | HEAD | Git ref of the Homebrew installer |
 
-The VNC password is generated randomly and printed at the end. Networking is DHCP on the chosen bridge.
+The VNC password is generated randomly and printed at the end. Answer `y` to "Configure advanced options" to be asked about VLAN, MTU, search domain, swap, timezone and start-on-boot; the same settings can always be preset through the environment. A static address is checked for validity and for an existing answer to ping before anything is created. Only IPv4 (or DHCP) is configured; add IPv6 afterwards in the container's Network settings.
+
+Example with a static address on a VLAN:
+
+```bash
+CT_PASSWORD='s3cret' IP_ADDRESS=10.20.0.50/24 GATEWAY=10.20.0.1 NAMESERVER=10.20.0.1 VLAN_TAG=20 \
+  ./setup-openclaw-lxc.sh --yes
+```
 
 ## What the script installs
 

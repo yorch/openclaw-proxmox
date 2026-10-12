@@ -8,7 +8,8 @@
 #
 # Every setting can be preset through the environment for unattended runs, e.g.:
 #   CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 CORES=6 ./setup-openclaw-lxc.sh
-# Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME BRIDGE
+# Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME
+#            BRIDGE IP_ADDRESS GATEWAY NAMESERVER SEARCHDOMAIN VLAN_TAG MTU SWAP TIMEZONE
 #            TMPL_STORAGE ROOT_STORAGE ONBOOT PRIVILEGED NODE_MAJOR OPENCLAW_VERSION
 #            HOMEBREW_INSTALL_REF EXPOSE_LAN
 #
@@ -33,6 +34,39 @@ ok()    { echo -e "${GREEN}✔${NC} $*"; }
 warn()  { echo -e "${YELLOW}!${NC} $*"; }
 err()   { echo -e "${RED}✘ $*${NC}" >&2; }
 fatal() { err "$@"; exit 1; }
+
+# in_array NEEDLE ITEM... — true if NEEDLE is one of the items
+in_array() {
+    local needle="$1" item
+    shift
+    for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+    return 1
+}
+
+# choose_option VAR LABEL DEFAULT ITEM... — numbered menu on a TTY (when there is a choice),
+# otherwise DEFAULT. A preset VAR is left alone.
+choose_option() {
+    local var="$1" label="$2" default="$3" choice="" n=0 item
+    shift 3
+    local -a items=("$@")
+    [[ -z "${!var:-}" ]] || return 0
+    if [[ -t 0 && ${#items[@]} -gt 1 ]]; then
+        echo "Available ${label}:"
+        for item in "${items[@]}"; do
+            n=$((n + 1))
+            printf '  %d) %s%s\n' "$n" "$item" "$([[ "$item" == "$default" ]] && echo '  (default)')"
+        done
+        read -rp "Select ${label} [${default}]: " choice
+        if [[ -z "$choice" ]]; then
+            choice="$default"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#items[@]} )); then
+            choice="${items[choice - 1]}"
+        fi
+        in_array "$choice" "${items[@]}" || fatal "Invalid selection '${choice}'."
+        default="$choice"
+    fi
+    printf -v "$var" '%s' "$default"
+}
 
 # stage TITLE — numbered section heading
 stage() {
@@ -130,10 +164,12 @@ command -v openssl >/dev/null 2>&1 || fatal "openssl not found."
 # ─── Settings (environment first, then prompts) ──────────────────────────────
 # ask VAR "Prompt" DEFAULT — keep a preset value, else prompt on a TTY, else use the default.
 ask() {
-    local var="$1" prompt="$2" default="$3" reply=""
+    local var="$1" prompt="$2" default="$3" reply="" hint
     [[ -z "${!var:-}" ]] || return 0
+    hint="[$default]"
+    [[ -n "$default" ]] || hint="(optional)"
     if [[ -t 0 ]]; then
-        read -rp "$prompt [$default]: " reply
+        read -rp "$prompt $hint: " reply
     fi
     printf -v "$var" '%s' "${reply:-$default}"
 }
@@ -162,8 +198,51 @@ ask MEMORY    "Memory in MB"     4096
 ask CORES     "CPU cores"        4
 ask VNC_RES   "VNC resolution"   1920x1080
 ask EXPOSE_LAN "Expose noVNC on the LAN over HTTPS? 1=yes 0=no (loopback only, use an SSH tunnel)" 0
-CT_HOSTNAME="${CT_HOSTNAME:-openclaw}"
-BRIDGE="${BRIDGE:-vmbr0}"
+ask CT_HOSTNAME "Hostname" openclaw
+
+# ── Networking ──
+mapfile -t BRIDGES < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 \
+    | grep -Ev '^(fwbr|fwpr|fwln|docker|virbr|lxcbr)' || true)
+if [[ -z "${BRIDGE:-}" ]]; then
+    (( ${#BRIDGES[@]} > 0 )) || fatal "No network bridge found on this host. Create one (Proxmox: Network → Create → Linux Bridge) or set BRIDGE."
+    BRIDGE_DEFAULT="${BRIDGES[0]}"
+    if in_array vmbr0 "${BRIDGES[@]}"; then BRIDGE_DEFAULT=vmbr0; fi
+    choose_option BRIDGE "network bridge" "$BRIDGE_DEFAULT" "${BRIDGES[@]}"
+fi
+ask IP_ADDRESS "IPv4 address as CIDR (e.g. 192.168.1.50/24), or 'dhcp'" dhcp
+if [[ "$IP_ADDRESS" != "dhcp" ]]; then
+    # Suggest the first host address of the network as the gateway
+    GATEWAY_DEFAULT=$(python3 -c '
+import ipaddress, sys
+try:
+    print(next(ipaddress.ip_interface(sys.argv[1]).network.hosts()))
+except (ValueError, StopIteration):
+    pass
+' "$IP_ADDRESS" 2>/dev/null || true)
+    ask GATEWAY "Gateway" "$GATEWAY_DEFAULT"
+    HOST_DNS=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null || true)
+    ask NAMESERVER "DNS server(s), space separated" "${HOST_DNS:-${GATEWAY:-1.1.1.1}}"
+fi
+
+# ── Advanced options (only asked on request; every one can be preset in the environment) ──
+if [[ -t 0 && "$ASSUME_YES" != "1" ]]; then
+    read -rp "Configure advanced options (VLAN, MTU, DNS search domain, swap, timezone, boot)? [y/N]: " ADVANCED
+    if [[ "$ADVANCED" =~ ^[Yy] ]]; then
+        ask VLAN_TAG      "VLAN tag"                 ""
+        ask MTU           "MTU"                      ""
+        ask SEARCHDOMAIN  "DNS search domain"        ""
+        ask SWAP          "Swap in MB"               512
+        ask TIMEZONE      "Timezone (e.g. Europe/Berlin, or 'host')" host
+        ask ONBOOT        "Start on host boot (1/0)" 1
+    fi
+fi
+GATEWAY="${GATEWAY:-}"
+NAMESERVER="${NAMESERVER:-}"
+SEARCHDOMAIN="${SEARCHDOMAIN:-}"
+VLAN_TAG="${VLAN_TAG:-}"
+MTU="${MTU:-}"
+SWAP="${SWAP:-512}"
+TIMEZONE="${TIMEZONE:-host}"
 ONBOOT="${ONBOOT:-1}"
 # Unprivileged by default; PRIVILEGED=1 is an explicit opt-in
 PRIVILEGED="${PRIVILEGED:-0}"
@@ -177,9 +256,42 @@ DISK_SIZE=$((10#$DISK_SIZE)); MEMORY=$((10#$MEMORY)); CORES=$((10#$CORES))
 [[ "$VNC_RES" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || fatal "VNC resolution must look like 1920x1080 (got '$VNC_RES')."
 [[ "$CT_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fatal "Invalid hostname '$CT_HOSTNAME'."
 [[ "$BRIDGE" =~ ^[a-zA-Z0-9_.-]+$ ]] || fatal "Invalid bridge name '$BRIDGE'."
+[[ -z "$VLAN_TAG" ]] || { require_int VLAN_TAG 1 4094; VLAN_TAG=$((10#$VLAN_TAG)); }
+[[ -z "$MTU" ]] || { require_int MTU 576 65535; MTU=$((10#$MTU)); }
+require_int SWAP 0 1000000
+SWAP=$((10#$SWAP))
+[[ -z "$SEARCHDOMAIN" || "$SEARCHDOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] || fatal "Invalid DNS search domain '$SEARCHDOMAIN'."
+[[ "$TIMEZONE" == "host" || -e "/usr/share/zoneinfo/$TIMEZONE" ]] || fatal "Unknown timezone '$TIMEZONE' (use e.g. Europe/Berlin, or 'host')."
+if [[ "$IP_ADDRESS" != "dhcp" ]]; then
+    [[ -n "$GATEWAY" ]] || fatal "A static address needs a GATEWAY."
+    python3 - "$IP_ADDRESS" "$GATEWAY" "$NAMESERVER" <<'PY' || fatal "Invalid static network settings."
+import ipaddress, sys
+addr, gw, dns = sys.argv[1:4]
+try:
+    iface = ipaddress.ip_interface(addr)
+    if iface.version != 4 or "/" not in addr:
+        raise ValueError("the address must be an IPv4 CIDR such as 192.168.1.50/24")
+    gateway = ipaddress.ip_address(gw)
+    if gateway.version != 4 or gateway not in iface.network:
+        raise ValueError(f"gateway {gw} is not an IPv4 address inside {iface.network}")
+    if gateway == iface.ip:
+        raise ValueError("the gateway cannot be the container's own address")
+    for server in dns.split():
+        ipaddress.ip_address(server)
+except ValueError as exc:
+    print(f"Error: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+fi
 [[ "$ONBOOT" =~ ^[01]$ ]] || fatal "ONBOOT must be 0 or 1."
 [[ "$EXPOSE_LAN" =~ ^[01]$ ]] || fatal "EXPOSE_LAN must be 0 or 1."
 ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist on this host."
+
+if [[ "$IP_ADDRESS" != "dhcp" ]] && command -v ping >/dev/null 2>&1; then
+    if ping -c 1 -W 1 "${IP_ADDRESS%/*}" >/dev/null 2>&1; then
+        fatal "${IP_ADDRESS%/*} already answers ping — pick an unused address."
+    fi
+fi
 
 echo
 
@@ -198,14 +310,6 @@ NODE=$(hostname -s)
 # Enabled storages on this node that can hold the given content type (JSON)
 node_storage() {
     pvesh get "/nodes/$NODE/storage" --content "$1" --enabled 1 --output-format json 2>/dev/null
-}
-
-# in_array NEEDLE ITEM... — true if NEEDLE is one of the items
-in_array() {
-    local needle="$1" item
-    shift
-    for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
-    return 1
 }
 
 # pick_storage VAR CONTENT LABEL PREFERRED INTERACTIVE
@@ -301,7 +405,12 @@ echo -e "${BOLD}Plan${NC}"
 kv "Container ID" "$VMID ($CT_HOSTNAME)"
 kv "Resources" "${CORES} cores · ${MEMORY} MB RAM · ${DISK_SIZE} GB disk on ${ROOT_STORAGE}"
 kv "Template" "$TEMPLATE (from ${TMPL_STORAGE})"
-kv "Network" "DHCP on ${BRIDGE}"
+NET_DESC="$([[ "$IP_ADDRESS" == "dhcp" ]] && echo "DHCP" || echo "${IP_ADDRESS} via ${GATEWAY}") on ${BRIDGE}"
+[[ -z "$VLAN_TAG" ]] || NET_DESC+=" · VLAN ${VLAN_TAG}"
+[[ -z "$MTU" ]] || NET_DESC+=" · MTU ${MTU}"
+kv "Network" "$NET_DESC"
+if [[ -n "$NAMESERVER$SEARCHDOMAIN" ]]; then kv "DNS" "${NAMESERVER:-host default}${SEARCHDOMAIN:+ · search $SEARCHDOMAIN}"; fi
+kv "Swap / timezone" "${SWAP} MB · ${TIMEZONE}"
 if [[ "$PRIVILEGED" == "1" ]]; then kv "Container type" "privileged (not recommended)"; else kv "Container type" "unprivileged, nesting enabled"; fi
 kv "Remote desktop" "${VNC_RES}, $([[ "$EXPOSE_LAN" == "1" ]] && echo "HTTPS on the LAN" || echo "loopback only (SSH tunnel)")"
 kv "Start on boot" "$([[ "$ONBOOT" == "1" ]] && echo yes || echo no)"
@@ -327,12 +436,28 @@ stage "Creating the container"
 
 # ─── Create the LXC container ────────────────────────────────────────────────
 info "Creating LXC container $VMID..."
+NET0="name=eth0,bridge=${BRIDGE}"
+if [[ "$IP_ADDRESS" == "dhcp" ]]; then
+    NET0+=",ip=dhcp"
+else
+    NET0+=",ip=${IP_ADDRESS},gw=${GATEWAY}"
+fi
+[[ -z "$VLAN_TAG" ]] || NET0+=",tag=${VLAN_TAG}"
+[[ -z "$MTU" ]] || NET0+=",mtu=${MTU}"
+
+PCT_EXTRA=()
+[[ -z "$NAMESERVER" ]] || PCT_EXTRA+=(--nameserver "$NAMESERVER")
+[[ -z "$SEARCHDOMAIN" ]] || PCT_EXTRA+=(--searchdomain "$SEARCHDOMAIN")
+
 pct create "$VMID" "${TMPL_STORAGE}:vztmpl/${TEMPLATE}" \
     --hostname "$CT_HOSTNAME" \
     --rootfs "${ROOT_STORAGE}:${DISK_SIZE}" \
     --memory "$MEMORY" \
     --cores "$CORES" \
-    --net0 "name=eth0,bridge=${BRIDGE},ip=dhcp" \
+    --net0 "$NET0" \
+    --swap "$SWAP" \
+    --timezone "$TIMEZONE" \
+    "${PCT_EXTRA[@]}" \
     --unprivileged "$UNPRIVILEGED" \
     --features nesting=1 \
     --onboot "$ONBOOT" \
@@ -364,14 +489,14 @@ ct_exec "true" >/dev/null 2>&1 || fatal "Container did not become reachable."
 stage "Waiting for the network"
 
 # ─── Wait for network ────────────────────────────────────────────────────────
-info "Waiting for DHCP lease (up to 60s)..."
+info "Waiting for the container's IPv4 address (up to 60s)..."
 CT_IP=""
 for _ in $(seq 1 60); do
     CT_IP=$(ct_ip)
     [[ -n "$CT_IP" ]] && break
     sleep 1
 done
-[[ -n "$CT_IP" ]] || fatal "Container got no IP address. Check that bridge '$BRIDGE' has a DHCP server."
+[[ -n "$CT_IP" ]] || fatal "Container got no IP address. Check bridge '$BRIDGE'$([[ "$IP_ADDRESS" == "dhcp" ]] && echo " (is there a DHCP server?)" || echo " and the VLAN/gateway settings")."
 ok "Container IP: $CT_IP"
 
 info "Checking DNS and internet access from the container..."

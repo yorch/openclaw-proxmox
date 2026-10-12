@@ -11,10 +11,10 @@ OpenClaw on Proxmox is a single-script deployment tool (`setup-openclaw-lxc.sh`)
 The entire project is one Bash script (`setup-openclaw-lxc.sh`) with this flow:
 
 1. **Pre-flight** — Verify Proxmox CLI tools (`pct`, `pvesh`, `pveam`), python3/openssl, root, amd64
-2. **Settings** — Environment variables first, then prompts (`ask()`); all inputs validated
+2. **Settings** — Environment variables first, then prompts (`ask()`, `choose_option()` menus for bridge/storage); an "advanced options" gate asks the rarely used ones; all inputs validated (static network settings via a Python `ipaddress` check)
 3. **VMID & storage** — VMID prompt defaults to `/cluster/nextid` and is validated; `pick_storage()` lists per-node enabled storage (`pvesh /nodes/<node>/storage` JSON + Python) as a menu, or validates a preset `ROOT_STORAGE`/`TMPL_STORAGE`
 4. **Template management** — Download newest Debian 13 template if missing
-5. **Container creation** — Unprivileged (nesting) by default, `PRIVILEGED=1` opts out; DHCP; `--onboot`
+5. **Container creation** — Unprivileged (nesting) by default, `PRIVILEGED=1` opts out; networking from `BRIDGE`/`IP_ADDRESS`/`GATEWAY`/`NAMESERVER`/`VLAN_TAG`/`MTU` (DHCP or validated static IPv4), plus swap, timezone and `--onboot`
 6. **Provisioning payload** — A single strict (`set -euo pipefail`) script, embedded as the `'PROVISION'` heredoc, is pushed with `pct push` together with a 0600 env file carrying secrets, then run once inside the container
 7. **Inside the container** (as the `openclaw` user where possible) — Node.js 24 (NodeSource apt repo; current OpenClaw needs Node ≥24.16 <25 or ≥26.1), Homebrew, OpenClaw, LXQt, TigerVNC, noVNC, Google Chrome, desktop config and shortcuts
 8. **Systemd services** — `openclaw-gateway` (18789), `vncserver` (:1/5901), `novnc` (6080); all run as `openclaw`, loopback-only; `EXPOSE_LAN=1` exposes only noVNC, `--ssl-only` with a self-signed cert (the Control UI needs a secure context, so the gateway never leaves loopback)

@@ -34,6 +34,10 @@ Key helpers: `ct_exec()` wraps `pct exec $VMID -- bash -c` for small host-driven
 - Auth token: `openssl rand -hex 16`; VNC password: random 8 alphanumerics (VNC truncates at 8).
 - Use Conventional Commits.
 
+## Repository
+
+GitHub: `yorch/openclaw-proxmox` (a fork of `adadrag/Openclaw-Proxmox`). Keep README install URLs pointing at this repo. Commit messages follow Conventional Commits.
+
 ## Testing Changes
 
 There is no automated test infrastructure. To test changes, run the script on a Proxmox host:

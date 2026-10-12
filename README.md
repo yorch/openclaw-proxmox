@@ -1,5 +1,7 @@
 # OpenClaw on Proxmox — One Script, Full AI Assistant
 
+[![lint](https://github.com/yorch/openclaw-proxmox/actions/workflows/lint.yml/badge.svg)](https://github.com/yorch/openclaw-proxmox/actions/workflows/lint.yml)
+
 Deploy your own **[OpenClaw](https://openclaw.ai/) AI assistant** on any Proxmox server in minutes. One command, zero manual setup.
 
 ## Why use this?
@@ -19,10 +21,10 @@ Deploy your own **[OpenClaw](https://openclaw.ai/) AI assistant** on any Proxmox
 SSH into your Proxmox host and run:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/adadrag/Openclaw-Proxmox/main/setup-openclaw-lxc.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/yorch/openclaw-proxmox/main/setup-openclaw-lxc.sh)
 ```
 
-That's it. The script will ask for a password, pick sensible defaults for everything else, and print your connection details when done.
+That's it. The script asks for a password, the container ID (VMID), the storage for the disk and a few sizing options (every prompt has a sensible default), then prints your connection details when done.
 
 Prefer to read it first? It's one file — download it (see below) and review it before running.
 
@@ -30,24 +32,22 @@ Prefer to read it first? It's one file — download it (see below) and review it
 
 **Download first, then run:**
 ```bash
-wget -O setup-openclaw-lxc.sh https://raw.githubusercontent.com/adadrag/Openclaw-Proxmox/main/setup-openclaw-lxc.sh
+wget -O setup-openclaw-lxc.sh https://raw.githubusercontent.com/yorch/openclaw-proxmox/main/setup-openclaw-lxc.sh
 chmod +x setup-openclaw-lxc.sh
 ./setup-openclaw-lxc.sh
 ```
 
 **Clone the repo:**
 ```bash
-git clone https://github.com/adadrag/Openclaw-Proxmox.git
-cd Openclaw-Proxmox
+git clone https://github.com/yorch/openclaw-proxmox.git
+cd openclaw-proxmox
 chmod +x setup-openclaw-lxc.sh
 ./setup-openclaw-lxc.sh
 ```
 
 ## What you get
 
-After the script finishes, you'll have a fully configured LXC container with:
-
-By default the dashboard and the remote desktop listen on the container's **loopback only**. Reach them through an SSH tunnel from your computer:
+After the script finishes, you'll have a fully configured LXC container. By default the dashboard and the remote desktop listen on the container's **loopback only**. Reach them through an SSH tunnel from your computer:
 
 ```bash
 ssh -L 6080:127.0.0.1:6080 -L 18789:127.0.0.1:18789 openclaw@<container-ip>
@@ -169,6 +169,19 @@ Chrome's sandbox needs user namespaces inside the container. As a last resort, r
 
 **Setup failed halfway?**
 The script keeps the half-built container for inspection and offers to destroy it. To start over: `pct stop <VMID>; pct destroy <VMID> --purge`.
+
+## Contributing
+
+Issues and pull requests are welcome at [yorch/openclaw-proxmox](https://github.com/yorch/openclaw-proxmox).
+
+- The project is a single Bash script; see [CLAUDE.md](CLAUDE.md) for the architecture and conventions.
+- Run `shellcheck setup-openclaw-lxc.sh` (CI also checks the embedded in-container script) and `bash -n` before opening a PR.
+- There is no automated test suite; test changes by running the script on a Proxmox host.
+- Use [Conventional Commits](https://www.conventionalcommits.org/) (`fix:`, `feat:`, `docs:`, …).
+
+## Credits
+
+Forked from [adadrag/Openclaw-Proxmox](https://github.com/adadrag/Openclaw-Proxmox), the original project.
 
 ## License
 

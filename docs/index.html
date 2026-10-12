@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenClaw on Proxmox — Self-hosted AI assistant in an LXC</title>
+  <meta name="description" content="One Bash script deploys the OpenClaw AI assistant in a private, unprivileged Proxmox LXC with a desktop, Chrome and browser remote access. Optional Tailscale. MIT.">
+  <meta name="keywords" content="OpenClaw, Proxmox, LXC, self-hosted AI assistant, Proxmox VE, noVNC, Tailscale, Debian 13, installer script, homelab">
+  <meta name="author" content="Jorge Barnaby">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <link rel="canonical" href="https://yorch.github.io/openclaw-proxmox/">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="OpenClaw on Proxmox">
+  <meta property="og:title" content="OpenClaw on Proxmox — a private AI assistant with its own desktop">
+  <meta property="og:description" content="One command on your Proxmox host: an unprivileged LXC with OpenClaw, an LXQt desktop, Chrome and noVNC. Private by default, optional Tailscale.">
+  <meta property="og:url" content="https://yorch.github.io/openclaw-proxmox/">
+  <meta property="og:image" content="https://yorch.github.io/openclaw-proxmox/assets/og-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="OpenClaw on Proxmox: one script, a private AI assistant with its own desktop">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="OpenClaw on Proxmox — a private AI assistant with its own desktop">
+  <meta name="twitter:description" content="One command on your Proxmox host: an unprivileged LXC with OpenClaw, an LXQt desktop, Chrome and noVNC.">
+  <meta name="twitter:image" content="https://yorch.github.io/openclaw-proxmox/assets/og-image.png">
+
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://yorch.github.io/openclaw-proxmox/#software",
+        "name": "OpenClaw on Proxmox",
+        "description": "A single Bash script that creates an unprivileged Debian 13 LXC container on Proxmox VE and installs the OpenClaw AI assistant, an LXQt desktop, Google Chrome and noVNC remote access, with optional Tailscale and GitHub SSH key import.",
+        "url": "https://yorch.github.io/openclaw-proxmox/",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Proxmox VE (Debian Linux, amd64)",
+        "softwareRequirements": "Proxmox VE 8 or 9 on amd64, root access, internet access",
+        "license": "https://opensource.org/licenses/MIT",
+        "isAccessibleForFree": true,
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+        "codeRepository": "https://github.com/yorch/openclaw-proxmox",
+        "programmingLanguage": "Bash",
+        "author": { "@type": "Person", "name": "Jorge Barnaby", "url": "https://github.com/yorch" }
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://yorch.github.io/openclaw-proxmox/#website",
+        "url": "https://yorch.github.io/openclaw-proxmox/",
+        "name": "OpenClaw on Proxmox",
+        "inLanguage": "en"
+      },
+      {
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "How do I install OpenClaw on Proxmox?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Run the installer as root on your Proxmox host: bash <(curl -fsSL https://raw.githubusercontent.com/yorch/openclaw-proxmox/main/setup-openclaw-lxc.sh). It asks for a password and a few options, shows a plan, and creates an unprivileged Debian 13 LXC with OpenClaw, an LXQt desktop, Chrome and noVNC." }
+          },
+          {
+            "@type": "Question",
+            "name": "Is OpenClaw exposed to my network or the internet?",
+            "acceptedAnswer": { "@type": "Answer", "text": "No. By default only SSH is reachable; the OpenClaw dashboard and the noVNC remote desktop listen on the container's loopback. You can reach them through an SSH tunnel, publish them privately on your tailnet with Tailscale Serve, or serve noVNC over HTTPS on your LAN. Tailscale Funnel (public internet) is intentionally not set up." }
+          },
+          {
+            "@type": "Question",
+            "name": "Why an unprivileged container and a non-root user?",
+            "acceptedAnswer": { "@type": "Answer", "text": "An AI agent that runs commands and drives a browser should be boxed in. In an unprivileged LXC where everything runs as a regular user with no sudo, a compromised agent or browser does not get root in the container or on the Proxmox host. Chrome keeps its sandbox." }
+          },
+          {
+            "@type": "Question",
+            "name": "Does it work on ARM or Raspberry Pi?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Not yet. Google Chrome is installed from its amd64 package, so the installer stops early on other architectures." }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I use a static IP, a VLAN or a custom bridge?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Yes. Choose the bridge from a menu, or set BRIDGE, IP_ADDRESS (DHCP or a static IPv4 CIDR), GATEWAY, NAMESERVER, SEARCHDOMAIN, VLAN_TAG and MTU as environment variables for unattended installs." }
+          },
+          {
+            "@type": "Question",
+            "name": "How do I log in over SSH with my GitHub key?",
+            "acceptedAnswer": { "@type": "Answer", "text": "Enter your GitHub username when asked, or set GITHUB_SSH_USER. The installer downloads github.com/<user>.keys over HTTPS, validates every key, shows the fingerprints for you to confirm and authorizes them for the openclaw user. SSH_DISABLE_PASSWORD=1 makes SSH key-only." }
+          }
+        ]
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top" aria-label="OpenClaw on Proxmox — home">
+        <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="url(#g1)"/><path d="M9 21l5-5-5-5M17 22h7" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/><defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f97316"/><stop offset="1" stop-color="#ec4899"/></linearGradient></defs></svg>
+        <span>OpenClaw <b>on Proxmox</b></span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#access">Access</a>
+        <a href="#security">Security</a>
+        <a href="#config">Configure</a>
+        <a href="#faq">FAQ</a>
+        <a class="btn btn-small" href="https://github.com/yorch/openclaw-proxmox">GitHub</a>
+        <button class="theme" id="theme" type="button" aria-label="Toggle light and dark theme"><span aria-hidden="true">◐</span></button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="wrap hero-grid">
+        <div>
+          <p class="eyebrow">Self-hosted · Open source · MIT</p>
+          <h1>Your own AI assistant,<br><span class="grad">in its own Proxmox container.</span></h1>
+          <p class="lead">One command on your Proxmox host creates a private, unprivileged LXC running the <a href="https://openclaw.ai/">OpenClaw</a> AI assistant with a full Linux desktop and a real browser — reachable from any browser, and not exposed to your network unless you say so.</p>
+
+          <div class="cmd" role="group" aria-label="Install command">
+            <code id="install-cmd">bash &lt;(curl -fsSL https://raw.githubusercontent.com/yorch/openclaw-proxmox/main/setup-openclaw-lxc.sh)</code>
+            <button class="copy" type="button" data-copy="#install-cmd" aria-label="Copy install command">Copy</button>
+          </div>
+          <p class="hint">Run as root on the Proxmox host. You'll see a plan and confirm before anything is created.</p>
+
+          <div class="cta">
+            <a class="btn" href="https://github.com/yorch/openclaw-proxmox#-quick-start">Read the quick start</a>
+            <a class="btn btn-ghost" href="https://github.com/yorch/openclaw-proxmox">View on GitHub</a>
+          </div>
+
+          <ul class="chips" aria-label="At a glance">
+            <li>Proxmox VE 8 / 9</li><li>Debian 13</li><li>Unprivileged LXC</li><li>LXQt + noVNC</li><li>Optional Tailscale</li>
+          </ul>
+        </div>
+
+        <figure class="term" aria-label="Example installer output">
+          <div class="term-bar"><i></i><i></i><i></i><span>setup-openclaw-lxc.sh</span></div>
+<pre><code><span class="dim">$</span> ./setup-openclaw-lxc.sh
+
+<span class="c">[1/6]</span> <b>Checking the host and collecting settings</b>
+<span class="c">[2/6]</span> <b>Selecting storage and template</b>
+<span class="dim">Plan</span>
+  Container ID    <b>105</b> (openclaw)
+  Resources       4 cores · 4096 MB · 32 GB on local-lvm
+  Network         DHCP on vmbr0
+  Remote desktop  1920x1080, loopback only
+<span class="c">[3/6]</span> <b>Creating the container</b>
+<span class="c">[4/6]</span> <b>Waiting for the network</b>
+<span class="c">[5/6]</span> <b>Provisioning the container</b>
+  [1/14] Updating packages …
+  <span class="dim">…</span>
+<span class="c">[6/6]</span> <b>Verifying services</b>
+<span class="g">✔</span> Gateway answers on 127.0.0.1:18789
+<span class="g">✔</span> VNC server listens on 127.0.0.1:5901
+
+<span class="g"><b>✔ OpenClaw is ready</b></span>  <span class="dim">(finished in 8m 12s)</span></code></pre>
+        </figure>
+      </div>
+    </section>
+
+    <section class="band" aria-label="Highlights">
+      <div class="wrap stats">
+        <div><b>1</b><span>command to deploy</span></div>
+        <div><b>6</b><span>numbered, readable stages</span></div>
+        <div><b>0</b><span>ports exposed by default</span></div>
+        <div><b>0</b><span>processes running as root</span></div>
+      </div>
+    </section>
+
+    <section id="features" class="section">
+      <div class="wrap">
+        <h2>Everything your agent needs, nothing it shouldn't have</h2>
+        <p class="sub">OpenClaw runs inside a purpose-built container so you can give it a real desktop and browser without handing it your homelab.</p>
+        <div class="grid">
+          <article class="card"><h3>🧱 Contained by design</h3><p>An unprivileged LXC with nesting. Gateway, desktop and Chrome run as a regular <code>openclaw</code> user — never root, and with no sudo.</p></article>
+          <article class="card"><h3>🔒 Private by default</h3><p>Only SSH is reachable. The dashboard and remote desktop sit on loopback until you choose a tunnel, Tailscale, or HTTPS on your LAN.</p></article>
+          <article class="card"><h3>🖥️ A desktop for your agent</h3><p>LXQt, Google Chrome and TigerVNC behind noVNC: open the desktop from any browser and watch your assistant work.</p></article>
+          <article class="card"><h3>🌐 Tailscale, optional</h3><p>Publish the dashboard and the desktop over HTTPS on your tailnet with real certificates. Token still required; no Funnel, no public exposure.</p></article>
+          <article class="card"><h3>🔑 SSH keys from GitHub</h3><p>Type your GitHub username: keys are fetched over HTTPS, validated, shown as fingerprints for you to confirm, and installed. Optionally key-only.</p></article>
+          <article class="card"><h3>⚙️ Fully configurable</h3><p>VMID, storage menu, bridge, static IP, VLAN, MTU, DNS, swap, timezone — interactively or entirely from environment variables.</p></article>
+          <article class="card"><h3>🛡️ Fails loudly</h3><p>Strict error handling in and out of the container, real health checks at the end, and an offer to clean up a failed run.</p></article>
+          <article class="card"><h3>♻️ Survives reboots</h3><p>The container and its three systemd services start with the host. Snapshot before upgrades; destroy to start over.</p></article>
+          <article class="card"><h3>📦 Batteries included</h3><p>Node.js 24 from a signed repo, OpenClaw, Homebrew for skills, and the Chrome extension's native host pre-registered.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="how" class="section alt">
+      <div class="wrap">
+        <h2>How it works</h2>
+        <p class="sub">The installer is a single Bash script you can read top to bottom. It runs in six stages and ends with a summary you can keep.</p>
+        <ol class="steps">
+          <li><b>Check the host &amp; collect settings</b><span>Prompts with sensible defaults, or environment variables for unattended installs. Everything is validated.</span></li>
+          <li><b>Pick storage &amp; template</b><span>A menu of enabled storages with free space, the newest Debian 13 template for your architecture, then a plan to confirm.</span></li>
+          <li><b>Create the container</b><span>Unprivileged, nesting on, your network settings, starts on boot.</span></li>
+          <li><b>Wait for the network</b><span>Waits for an IPv4 address and DNS before touching packages.</span></li>
+          <li><b>Provision</b><span>One strict script is pushed in and run: user, Node.js, Homebrew, OpenClaw, desktop, Chrome, services. 14 counted steps.</span></li>
+          <li><b>Verify</b><span>Probes the gateway, VNC and noVNC over HTTP and ports — not just “service active” — then prints your connection details.</span></li>
+        </ol>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 880 300" role="img" aria-labelledby="dg-t dg-d">
+            <title id="dg-t">Architecture</title>
+            <desc id="dg-d">You connect over an SSH tunnel, Tailscale or HTTPS to noVNC, which proxies TigerVNC and the LXQt desktop with Chrome. Chrome talks to the OpenClaw gateway on port 18789. Everything runs as the openclaw user inside an unprivileged LXC on Proxmox.</desc>
+            <defs>
+              <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ar"/></marker>
+            </defs>
+            <rect x="8" y="8" width="864" height="284" rx="18" class="d-frame"/>
+            <text x="28" y="36" class="d-lab">Proxmox host · unprivileged Debian 13 LXC · everything runs as user “openclaw”</text>
+            <g class="d-box"><rect x="30" y="110" width="130" height="64" rx="12"/><text x="95" y="138" text-anchor="middle">You</text><text x="95" y="158" text-anchor="middle" class="d-sm">browser / SSH</text></g>
+            <g class="d-box"><rect x="220" y="110" width="130" height="64" rx="12"/><text x="285" y="138" text-anchor="middle">noVNC</text><text x="285" y="158" text-anchor="middle" class="d-sm">:6080</text></g>
+            <g class="d-box"><rect x="400" y="110" width="130" height="64" rx="12"/><text x="465" y="138" text-anchor="middle">TigerVNC</text><text x="465" y="158" text-anchor="middle" class="d-sm">:5901</text></g>
+            <g class="d-box"><rect x="580" y="62" width="130" height="64" rx="12"/><text x="645" y="90" text-anchor="middle">LXQt desktop</text><text x="645" y="110" text-anchor="middle" class="d-sm">Chrome (sandboxed)</text></g>
+            <g class="d-box d-hot"><rect x="580" y="188" width="130" height="64" rx="12"/><text x="645" y="216" text-anchor="middle">OpenClaw</text><text x="645" y="236" text-anchor="middle" class="d-sm">gateway :18789</text></g>
+            <g class="d-box"><rect x="740" y="188" width="110" height="64" rx="12"/><text x="795" y="216" text-anchor="middle">Tailscale</text><text x="795" y="236" text-anchor="middle" class="d-sm">optional · Serve</text></g>
+            <path d="M160 142H218" class="d-line" marker-end="url(#ar)"/>
+            <path d="M350 142H398" class="d-line" marker-end="url(#ar)"/>
+            <path d="M530 130L578 100" class="d-line" marker-end="url(#ar)"/>
+            <path d="M645 126V186" class="d-line d-dash" marker-start="url(#ar)" marker-end="url(#ar)"/>
+            <path d="M740 220H712" class="d-line d-dash" marker-end="url(#ar)"/>
+            <text x="190" y="104" text-anchor="middle" class="d-sm">tunnel · HTTPS</text>
+            <text x="672" y="160" class="d-sm">extension</text>
+          </svg>
+          <figcaption>Services start with the container as three systemd units: <code>openclaw-gateway</code>, <code>vncserver</code>, <code>novnc</code>.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="access" class="section">
+      <div class="wrap">
+        <h2>Three ways in — pick your comfort level</h2>
+        <p class="sub">The default is the safest. Opt in to convenience when you trust the network.</p>
+        <div class="grid g3">
+          <article class="card"><span class="tag">Default</span><h3>SSH tunnel</h3><p>Everything on loopback. Forward two ports and browse locally:</p><pre><code>ssh -L 6080:127.0.0.1:6080 \
+    -L 18789:127.0.0.1:18789 \
+    openclaw@&lt;container-ip&gt;</code></pre></article>
+          <article class="card"><span class="tag t-hot">Recommended for remote</span><h3>Tailscale Serve</h3><p>Join your tailnet and get <code>https://&lt;host&gt;.&lt;tailnet&gt;.ts.net</code> for the dashboard and <code>:8443</code> for the desktop, with valid certificates. Login with an auth key or a link.</p><pre><code>ENABLE_TAILSCALE=1 \
+./setup-openclaw-lxc.sh</code></pre></article>
+          <article class="card"><span class="tag">Trusted LAN</span><h3>HTTPS on your LAN</h3><p>Serve noVNC at <code>https://&lt;ip&gt;:6080</code> (HTTPS only, self-signed certificate, random VNC password). The dashboard stays on loopback.</p><pre><code>EXPOSE_LAN=1 \
+./setup-openclaw-lxc.sh</code></pre></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="security" class="section alt">
+      <div class="wrap">
+        <h2>Security model</h2>
+        <p class="sub">An agent that runs commands and browses the web is worth fencing in. Here is exactly how.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Layer</th><th scope="col">Choice</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Container</th><td>Unprivileged with nesting — a container escape needs more than a root process inside it.</td></tr>
+              <tr><th scope="row">Processes</th><td>Gateway, desktop and Chrome run as <code>openclaw</code>, not root. Chrome keeps its sandbox.</td></tr>
+              <tr><th scope="row">Privileges</th><td>No sudo for <code>openclaw</code>. Administer from the host with <code>pct enter</code>.</td></tr>
+              <tr><th scope="row">Network</th><td>Only SSH is reachable by default. noVNC and the gateway stay on loopback; with Tailscale they are published on your tailnet only (no Funnel).</td></tr>
+              <tr><th scope="row">Authentication</th><td>Dashboard token is always required, even on your tailnet. Optional GitHub SSH keys with fingerprint confirmation and optional key-only login.</td></tr>
+              <tr><th scope="row">Secrets</th><td>Passed into the container as private files, never on command lines, and removed afterwards.</td></tr>
+              <tr><th scope="row">Supply chain</th><td>Node.js from a signed apt repository (no piped installers); versions can be pinned.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note"><b>Be honest about the limits:</b> the agent can still run commands as <code>openclaw</code> and browse for you, and VNC passwords are capped at 8 characters by the protocol. Put the container on a network segment you are comfortable with.</p>
+      </div>
+    </section>
+
+    <section id="config" class="section">
+      <div class="wrap">
+        <h2>Configure it your way</h2>
+        <p class="sub">Answer the prompts, or preset anything as an environment variable and add <code>--yes</code> for a fully unattended install.</p>
+        <div class="two">
+          <div>
+<pre class="block"><code><span class="dim"># static IP on a VLAN, bigger disk, GitHub SSH keys</span>
+CT_PASSWORD='change-me' \
+DISK_SIZE=64 MEMORY=8192 \
+IP_ADDRESS=10.20.0.50/24 GATEWAY=10.20.0.1 \
+VLAN_TAG=20 GITHUB_SSH_USER=octocat \
+./setup-openclaw-lxc.sh --yes</code></pre>
+          </div>
+          <div class="table-wrap">
+            <table class="compact">
+              <thead><tr><th scope="col">Variable</th><th scope="col">Default</th><th scope="col">What it does</th></tr></thead>
+              <tbody>
+                <tr><td><code>VMID</code></td><td>next free</td><td>Container ID</td></tr>
+                <tr><td><code>ROOT_STORAGE</code></td><td>menu</td><td>Where the disk lives</td></tr>
+                <tr><td><code>BRIDGE</code></td><td>menu</td><td>Network bridge</td></tr>
+                <tr><td><code>IP_ADDRESS</code></td><td>dhcp</td><td>DHCP or static CIDR</td></tr>
+                <tr><td><code>EXPOSE_LAN</code></td><td>0</td><td>noVNC over HTTPS on LAN</td></tr>
+                <tr><td><code>ENABLE_TAILSCALE</code></td><td>0</td><td>Publish on your tailnet</td></tr>
+                <tr><td><code>GITHUB_SSH_USER</code></td><td>—</td><td>Authorize your GitHub keys</td></tr>
+                <tr><td><code>OPENCLAW_VERSION</code></td><td>latest</td><td>Pin the OpenClaw version</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub"><a href="https://github.com/yorch/openclaw-proxmox#%EF%B8%8F-configuration">See every option in the README →</a></p>
+      </div>
+    </section>
+
+    <section id="faq" class="section alt">
+      <div class="wrap narrow">
+        <h2>Frequently asked questions</h2>
+        <details><summary>How do I install OpenClaw on Proxmox?</summary><p>Run the one-line command above as root on your Proxmox host. It asks for a password and a handful of options, shows a plan, and creates an unprivileged Debian 13 LXC with OpenClaw, an LXQt desktop, Chrome and noVNC. It typically takes several minutes.</p></details>
+        <details><summary>Is OpenClaw exposed to my network or the internet?</summary><p>No. By default only SSH is reachable; the dashboard and remote desktop listen on the container's loopback. Reach them through an SSH tunnel, publish them privately on your tailnet with Tailscale Serve, or serve noVNC over HTTPS on your LAN. Tailscale Funnel (public internet) is intentionally not set up.</p></details>
+        <details><summary>Why an unprivileged container and a non-root user?</summary><p>So that a compromised agent or browser does not get root — in the container or on the Proxmox host. Everything runs as <code>openclaw</code> with no sudo, and Chrome keeps its sandbox.</p></details>
+        <details><summary>Does it work on ARM or a Raspberry Pi?</summary><p>Not yet. Google Chrome is installed from its amd64 package, so the installer stops early on other architectures.</p></details>
+        <details><summary>Can I use a static IP, a VLAN or a custom bridge?</summary><p>Yes — pick the bridge from a menu or set <code>BRIDGE</code>, <code>IP_ADDRESS</code>, <code>GATEWAY</code>, <code>NAMESERVER</code>, <code>SEARCHDOMAIN</code>, <code>VLAN_TAG</code> and <code>MTU</code>. Static settings are validated and an address that already answers ping is refused.</p></details>
+        <details><summary>How do I log in over SSH with my GitHub key?</summary><p>Enter your GitHub username when asked (or set <code>GITHUB_SSH_USER</code>). The installer downloads <code>github.com/&lt;user&gt;.keys</code> over HTTPS, validates every key, shows fingerprints for you to confirm and authorizes them for <code>openclaw</code>. Set <code>SSH_DISABLE_PASSWORD=1</code> for key-only login — keep a way in with <code>pct enter</code>.</p></details>
+        <details><summary>Which Proxmox versions are supported?</summary><p>Proxmox VE 9 is the target. Debian 13 containers need a recent <code>pve-container</code> (6.0.10 or newer has been reported to work); support on PVE 8 is unconfirmed — run <code>apt full-upgrade</code> if <code>pct create</code> rejects the template.</p></details>
+        <details><summary>How do I update or remove it?</summary><p>Update OpenClaw inside the container with <code>npm install -g openclaw@latest</code> and restart <code>openclaw-gateway</code>. Snapshot first with <code>pct snapshot</code>. To remove everything: <code>pct stop &lt;VMID&gt;; pct destroy &lt;VMID&gt; --purge</code>.</p></details>
+      </div>
+    </section>
+
+    <section class="section final">
+      <div class="wrap center">
+        <h2>Ready when you are</h2>
+        <p class="sub">Read the script, then run it. It's one file.</p>
+        <div class="cta">
+          <a class="btn" href="https://github.com/yorch/openclaw-proxmox">Get it on GitHub</a>
+          <a class="btn btn-ghost" href="https://github.com/yorch/openclaw-proxmox/blob/main/setup-openclaw-lxc.sh">Read the script</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap">
+      <p>MIT licensed · <a href="https://github.com/yorch/openclaw-proxmox">yorch/openclaw-proxmox</a> · forked from <a href="https://github.com/adadrag/Openclaw-Proxmox">adadrag/Openclaw-Proxmox</a> and substantially reworked.</p>
+      <p class="fine">An independent community project. Not affiliated with or endorsed by OpenClaw, Proxmox Server Solutions, Tailscale, Google or GitHub. All trademarks belong to their owners.</p>
+    </div>
+  </footer>
+
+  <script src="assets/app.js" defer></script>
+</body>
+</html>

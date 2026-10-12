@@ -42,6 +42,8 @@ Key helpers: `ct_exec()` wraps `pct exec $VMID -- bash -c` for small host-driven
 
 ## Repository
 
+`docs/` is the static GitHub Pages site (`index.html`, `assets/`, `robots.txt`, `sitemap.xml`, `404.html`, `.nojekyll`; no build step, no external dependencies), published from the `main` branch `/docs` folder at https://yorch.github.io/openclaw-proxmox/. When features or defaults change, update the site copy, the FAQ and its JSON-LD (`FAQPage`) together with the README; `assets/og-image.png` is the social card (1200x630).
+
 The README is the project's front page: keep its tables (env vars, security model) in sync with the script. `assets/banner.svg` is the hand-written header image.
 
 GitHub: `yorch/openclaw-proxmox` (a fork of `adadrag/Openclaw-Proxmox`). Keep README install URLs pointing at this repo. Commit messages follow Conventional Commits.

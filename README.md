@@ -10,6 +10,7 @@
 ![Debian 13](https://img.shields.io/badge/Debian-13%20(trixie)-a81d33?logo=debian&logoColor=white)
 ![Shell](https://img.shields.io/badge/made%20with-bash-4eaa25?logo=gnubash&logoColor=white)
 
+**[Website](https://yorch.github.io/openclaw-proxmox/)** ·
 **[Quick start](#-quick-start)** ·
 **[How it works](#-how-it-works)** ·
 **[Configuration](#-configuration)** ·

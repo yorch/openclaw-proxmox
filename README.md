@@ -103,8 +103,8 @@ CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 EXPOSE_LAN=1 ./setup-openclaw-lxc.
 | `BRIDGE` | vmbr0 | Network bridge (DHCP) |
 | `ROOT_STORAGE` | prompted menu | Storage for the container disk; the menu lists enabled storages on the node with free space (default `local-lvm`) |
 | `TMPL_STORAGE` | auto | Storage for the Debian template (default `local`) |
-| `OPENCLAW_VERSION` | latest | npm version of OpenClaw to install |
-| `NODE_MAJOR` | 22 | Node.js major version |
+| `OPENCLAW_VERSION` | latest | npm version of OpenClaw to install (releases before 2026.9.3 have known security advisories; releases from 2026.9 need Node 24+) |
+| `NODE_MAJOR` | 24 | Node.js major version (current OpenClaw needs Node ≥ 24.16 <25 or ≥ 26.1) |
 | `HOMEBREW_INSTALL_REF` | HEAD | Git ref of the Homebrew installer |
 
 The VNC password is generated randomly and printed at the end. Networking is DHCP on the chosen bridge.
@@ -115,10 +115,10 @@ All inside the container (nothing is installed on the Proxmox host):
 
 - **Debian 13** LXC (unprivileged, nesting enabled)
 - A regular **`openclaw`** user that runs everything — nothing runs as root
-- **Node.js 22** (from the signed NodeSource apt repository) + **OpenClaw**
+- **Node.js 24** (from the signed NodeSource apt repository) + **OpenClaw**
 - **Homebrew** (for OpenClaw skills)
 - **LXQt** desktop + **TigerVNC** + **noVNC**
-- **Google Chrome** with its sandbox enabled; the OpenClaw browser extension is downloaded, and you load it in Chrome once (see below)
+- **Google Chrome** with its sandbox enabled; the OpenClaw native host is registered, and you add the extension from the Chrome Web Store once (see below)
 - **Noto Color Emoji** font (for proper terminal rendering)
 - Three **systemd services**: `openclaw-gateway`, `vncserver`, `novnc`
 
@@ -148,6 +148,8 @@ When you run the **OpenClaw Setup Wizard** from the desktop shortcut, you may se
 
 **"SECURITY ERROR: ws:// to a non-loopback address"** — The gateway listens on loopback only, so you should not normally see this. If you reconfigure it to bind to the LAN, the token travels in clear text and the Control UI will not work over plain HTTP; use the SSH tunnel instead.
 
+The setup script already runs the gateway as a system service, so the wizard shortcut starts `openclaw onboard --skip-daemon` and tells it not to manage services. If you run the wizard yourself, decline any prompt to install a daemon. `openclaw dashboard` can also generate a one-time pairing link for the Control UI.
+
 The wizard may also offer to change the gateway's bind address or token, or to install its own service. Decline those: the `openclaw-gateway` service and the dashboard shortcut depend on the settings the setup script wrote.
 
 As long as you see your **channels connected**, a **Control UI URL**, and an **agent workspace** listed at the end of the wizard, everything worked.
@@ -162,7 +164,7 @@ pct exec <VMID> -- systemctl status novnc
 ```
 
 **Chrome extension not loading?**
-The extension is not activated automatically. Follow the instructions printed by `openclaw browser extension install` (the setup script saved that output to `~/openclaw-extension.txt` in the container, as `openclaw`); current OpenClaw releases install a native host and take the extension from the Chrome Web Store, and only need **Load unpacked** at `chrome://extensions` for a local build.
+The setup script runs `openclaw browser extension install`, which registers the native messaging host (its output is saved to `~/openclaw-extension.txt` in the container). On Linux you then add the extension yourself from the [Chrome Web Store](https://chromewebstore.google.com/detail/kcdjddhmeafeomebliikmbpblkmkfoig) and can verify it with `openclaw browser extension status`. If the install step failed (it needs Chrome to have run once), re-run it as the `openclaw` user after starting Chrome. **Load unpacked** at `chrome://extensions` is only for local development builds (`--no-store`).
 
 **Chrome won't start (sandbox error)?**
 Chrome's sandbox needs user namespaces inside the container. As a last resort, run `echo --no-sandbox > /etc/openclaw/chrome-flags` as root in the container — this weakens isolation.

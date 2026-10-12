@@ -16,7 +16,7 @@ The entire project is one Bash script (`setup-openclaw-lxc.sh`) with this flow:
 4. **Template management** — Download newest Debian 13 template if missing
 5. **Container creation** — Unprivileged (nesting) by default, `PRIVILEGED=1` opts out; DHCP; `--onboot`
 6. **Provisioning payload** — A single strict (`set -euo pipefail`) script, embedded as the `'PROVISION'` heredoc, is pushed with `pct push` together with a 0600 env file carrying secrets, then run once inside the container
-7. **Inside the container** (as the `openclaw` user where possible) — Node.js (NodeSource apt repo), Homebrew, OpenClaw, LXQt, TigerVNC, noVNC, Google Chrome, desktop config and shortcuts
+7. **Inside the container** (as the `openclaw` user where possible) — Node.js 24 (NodeSource apt repo; current OpenClaw needs Node ≥24.16 <25 or ≥26.1), Homebrew, OpenClaw, LXQt, TigerVNC, noVNC, Google Chrome, desktop config and shortcuts
 8. **Systemd services** — `openclaw-gateway` (18789), `vncserver` (:1/5901), `novnc` (6080); all run as `openclaw`, loopback-only; `EXPOSE_LAN=1` exposes only noVNC, `--ssl-only` with a self-signed cert (the Control UI needs a secure context, so the gateway never leaves loopback)
 9. **Verification** — Check services are active, print connection info
 10. **Failure handling** — `cleanup` EXIT trap offers to destroy a half-built container
@@ -29,6 +29,7 @@ Key helpers: `ct_exec()` wraps `pct exec $VMID -- bash -c` for small host-driven
 - The provisioning script is a quoted heredoc: no escaping needed inside it. Values come from the sourced env file (`printf %q` on the host). Files inside it that need variable expansion use an unquoted inner heredoc.
 - Never put secrets on a command line; add them to `provision.env`.
 - Chrome runs with its sandbox; extra flags go in `/etc/openclaw/chrome-flags` via the `/usr/local/bin/google-chrome` wrapper. We ship our own `.desktop` file rather than editing the package's.
+- OpenClaw compatibility notes: binary `openclaw`, config `~/.openclaw/openclaw.json`; npm ≥11.16 needs `--allow-scripts=openclaw`; the gateway unit follows OpenClaw's documented system-service template and sets `OPENCLAW_SERVICE_REPAIR_POLICY=external` so onboarding/doctor do not install a competing user unit; the browser extension comes from the Chrome Web Store on Linux.
 - Homebrew is installed by the `openclaw` user; a temporary sudoers grant exists only during the installer.
 - noVNC auto-scaling is set with `/usr/share/novnc/defaults.json` (dpkg-diverted so upgrades keep it), not by patching `ui.js`.
 - Auth token: `openssl rand -hex 16`; VNC password: random 8 alphanumerics (VNC truncates at 8).

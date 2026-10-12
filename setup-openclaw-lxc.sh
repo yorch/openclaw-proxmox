@@ -322,7 +322,7 @@ chmod 700 "$WORKDIR"
     printf 'EXPOSE_LAN=%q\n'           "$EXPOSE_LAN"
     printf 'CT_HOSTNAME=%q\n'          "$CT_HOSTNAME"
     printf 'VNC_RES=%q\n'              "$VNC_RES"
-    printf 'NODE_MAJOR=%q\n'           "${NODE_MAJOR:-22}"
+    printf 'NODE_MAJOR=%q\n'           "${NODE_MAJOR:-24}"
     printf 'OPENCLAW_VERSION=%q\n'     "${OPENCLAW_VERSION:-latest}"
     printf 'HOMEBREW_INSTALL_REF=%q\n' "${HOMEBREW_INSTALL_REF:-HEAD}"
 } > "$WORKDIR/provision.env"
@@ -386,6 +386,13 @@ quiet apt-get update
 apt_install nodejs
 [[ "$(node -p 'process.versions.node.split(".")[0]')" == "$NODE_MAJOR" ]] \
     || { echo "Node.js ${NODE_MAJOR} was not installed" >&2; exit 1; }
+# Current OpenClaw releases require Node >=24.16.0 <25 or >=26.1.0 (Node 22/23/25 are unsupported)
+if ! node -e '
+const [maj, min] = process.versions.node.split(".").map(Number);
+process.exit((maj === 24 && min >= 16) || (maj === 26 && min >= 1) || maj > 26 ? 0 : 1);
+'; then
+    echo "WARNING: Node.js $(node -v) is outside the range current OpenClaw supports (>=24.16 <25 or >=26.1); OpenClaw may refuse to start." >&2
+fi
 
 # ── Homebrew (needed by OpenClaw skills; installed as the login user) ────────
 step "Installing Homebrew"
@@ -404,7 +411,10 @@ grep -qs 'brew shellenv' "$USER_HOME/.bashrc" \
 
 # ── OpenClaw ─────────────────────────────────────────────────────────────────
 step "Installing OpenClaw (${OPENCLAW_VERSION})"
-quiet npm install -g "openclaw@${OPENCLAW_VERSION}"
+# npm 11.16+/12 blocks the package's install scripts unless explicitly allowed
+NPM_FLAGS=()
+if dpkg --compare-versions "$(npm -v)" ge 11.16.0; then NPM_FLAGS+=(--allow-scripts=openclaw); fi
+quiet npm install -g "openclaw@${OPENCLAW_VERSION}" "${NPM_FLAGS[@]}"
 OPENCLAW_BIN=$(command -v openclaw) || { echo "openclaw binary not found after install" >&2; exit 1; }
 
 # ── Desktop, VNC, noVNC ──────────────────────────────────────────────────────
@@ -428,7 +438,10 @@ GATEWAY_BIND=loopback
 as_user openclaw config set gateway.bind "$GATEWAY_BIND"
 as_user openclaw config set gateway.auth.token "$AUTH_TOKEN"
 
+# The extension installer needs Chrome's profile directory to exist, so start Chrome once.
 step "Installing the OpenClaw browser extension"
+as_user timeout 30 /usr/bin/google-chrome-stable --headless=new --disable-gpu --no-first-run \
+    --dump-dom about:blank >/dev/null 2>&1 || true
 if as_user openclaw browser extension install > "$USER_HOME/openclaw-extension.txt" 2>&1; then
     chown "$CT_USER:$CT_USER" "$USER_HOME/openclaw-extension.txt"
 else
@@ -588,7 +601,7 @@ Version=1.0
 Type=Application
 Name=OpenClaw Setup Wizard
 Comment=Run the OpenClaw onboarding wizard to configure your AI assistant
-Exec=lxterminal --title='OpenClaw Onboarding' -e sh -c 'openclaw onboard; exec bash'
+Exec=lxterminal --title='OpenClaw Onboarding' -e sh -c 'OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw onboard --skip-daemon; exec bash'
 Icon=utilities-terminal
 Terminal=false
 Categories=Utility;
@@ -620,16 +633,26 @@ cat > /etc/systemd/system/openclaw-gateway.service <<SVC
 Description=OpenClaw Gateway
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=10
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
 User=${CT_USER}
 Environment=HOME=${USER_HOME}
 Environment=NODE_ENV=production
+Environment=OPENCLAW_SERVICE_REPAIR_POLICY=external
 WorkingDirectory=${USER_HOME}
 ExecStart=${OPENCLAW_BIN} gateway run --bind ${GATEWAY_BIND} --auth token
 Restart=always
 RestartSec=5
+# Hardening/restart policy from the OpenClaw systemd guidance
+RestartPreventExitStatus=78
+SuccessExitStatus=0 143
+TimeoutStartSec=30
+TimeoutStopSec=330
+KillMode=mixed
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
@@ -725,7 +748,8 @@ echo -e "    http://localhost:18789/"
 echo -e "    Auth token: ${CYAN}${AUTH_TOKEN}${NC}"
 echo
 echo -e "  ${BOLD}Browser Extension:${NC}"
-echo -e "    Follow the output of 'openclaw browser extension install' (saved to ~/openclaw-extension.txt)."
+echo -e "    Add it from the Chrome Web Store (ID kcdjddhmeafeomebliikmbpblkmkfoig), then check it with"
+echo -e "    'openclaw browser extension status'. Install log: ~/openclaw-extension.txt"
 if [[ -n "$EXT_INFO" ]]; then
     echo -e "    Output of 'openclaw browser extension install':"
     while IFS= read -r line; do echo "      $line"; done <<<"$EXT_INFO"

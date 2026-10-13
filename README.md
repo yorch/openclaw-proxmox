@@ -266,7 +266,7 @@ Static settings are validated (address form, gateway inside the network, DNS ent
 |---|---|
 | Container | **Unprivileged** with nesting; a container escape needs more than a root process inside it |
 | Processes | Gateway, desktop and Chrome run as **`openclaw`**, not root; Chrome keeps its **sandbox** |
-| Privileges | `openclaw` has **no sudo** by default; administer with `pct enter <VMID>` from the host. `ENABLE_SUDO=1` adds it to the `sudo` group, and every `sudo` then needs the user's password |
+| Privileges | `openclaw` has **no general sudo** by default; administer with `pct enter <VMID>` from the host. The only exception is a narrow rule that lets it run `sudo systemctl restart openclaw-gateway` (nothing else, no password). `ENABLE_SUDO=1` adds it to the `sudo` group, and every other `sudo` then needs the user's password |
 | Network | Only **SSH** is reachable by default; noVNC and the gateway are on loopback. With Tailscale they are published on your tailnet only (no Funnel) |
 | SSH | Optional **key login** with your GitHub public keys (fetched over HTTPS, validated, fingerprints shown for confirmation); `SSH_DISABLE_PASSWORD=1` makes it key-only |
 | Remote desktop | Optional **HTTPS-only** noVNC (`EXPOSE_LAN=1`) with a generated certificate and a random VNC password |
@@ -284,7 +284,15 @@ pct snapshot <VMID> before-upgrade     # snapshot before risky changes
 pct exec <VMID> -- systemctl status openclaw-gateway vncserver novnc
 ```
 
-**Update OpenClaw** (inside the container, as root): `npm install -g openclaw@latest`, then `systemctl restart openclaw-gateway`. Check the [Node requirement](#-configuration) when jumping versions.
+**Restart the gateway** after changing its config: inside the container as `openclaw`, run `sudo systemctl restart openclaw-gateway` (a narrow, passwordless rule allows exactly that); from the host, `pct exec <VMID> -- systemctl restart openclaw-gateway`.
+
+**Containers installed before this rule existed** can get it with one command on the Proxmox host:
+
+```bash
+pct exec <VMID> -- bash -c 'S=$(readlink -f "$(command -v systemctl)"); echo "openclaw ALL=(root) NOPASSWD: $S restart openclaw-gateway, $S restart openclaw-gateway.service" > /etc/sudoers.d/openclaw-gateway && chmod 440 /etc/sudoers.d/openclaw-gateway && visudo -cf /etc/sudoers.d/openclaw-gateway'
+```
+
+**Update OpenClaw** (inside the container, as root, e.g. `pct enter <VMID>`): `npm install -g openclaw@latest`, then restart the gateway. Check the [Node requirement](#-configuration) when jumping versions.
 
 **Start over / remove**: `pct stop <VMID>; pct destroy <VMID> --purge`. This deletes the container and its disk.
 

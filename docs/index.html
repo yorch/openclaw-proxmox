@@ -261,7 +261,7 @@
             <tbody>
               <tr><th scope="row">Container</th><td>Unprivileged with nesting — a container escape needs more than a root process inside it.</td></tr>
               <tr><th scope="row">Processes</th><td>Gateway, desktop and Chrome run as <code>openclaw</code>, not root. Chrome keeps its sandbox.</td></tr>
-              <tr><th scope="row">Privileges</th><td>No sudo for <code>openclaw</code> by default; administer from the host with <code>pct enter</code>. Opt in with <code>ENABLE_SUDO=1</code> and every <code>sudo</code> still needs the user's password.</td></tr>
+              <tr><th scope="row">Privileges</th><td>No general sudo for <code>openclaw</code> by default; administer from the host with <code>pct enter</code>. The one exception is a narrow rule that lets it restart the gateway. Opt in to full sudo with <code>ENABLE_SUDO=1</code>; every other <code>sudo</code> still needs the user's password.</td></tr>
               <tr><th scope="row">Network</th><td>Only SSH is reachable by default. noVNC and the gateway stay on loopback; with Tailscale they are published on your tailnet only (no Funnel).</td></tr>
               <tr><th scope="row">Authentication</th><td>Dashboard token is always required, even on your tailnet. Optional GitHub SSH keys with fingerprint confirmation and optional key-only login.</td></tr>
               <tr><th scope="row">Secrets</th><td>Passed into the container as private files, never on command lines, and removed afterwards.</td></tr>

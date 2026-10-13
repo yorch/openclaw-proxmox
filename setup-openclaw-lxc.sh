@@ -915,7 +915,7 @@ if [[ "$ENABLE_TAILSCALE" == "1" ]]; then
             # noVNC gets its own port; OpenClaw owns HTTPS 443 for the dashboard. With EXPOSE_LAN
             # noVNC speaks TLS (self-signed) on loopback, so Serve must talk TLS to it too.
             if [[ "$EXPOSE_LAN" == "1" ]]; then NOVNC_TARGET="https+insecure://127.0.0.1:6080"; else NOVNC_TARGET="http://127.0.0.1:6080"; fi
-            TS_RECOVER="tailscale serve --bg --https=8443 ${NOVNC_TARGET}; then as ${CT_USER}: openclaw config set gateway.tailscale.mode serve && openclaw config set gateway.auth.allowTailscale false; systemctl restart openclaw-gateway"
+            TS_RECOVER="tailscale serve --bg --https=8443 ${NOVNC_TARGET}; then as ${CT_USER}: openclaw config set gateway.tailscale.mode serve && openclaw config set gateway.auth.allowTailscale false; sudo systemctl restart openclaw-gateway"
             if ! ts_has_cert_domains; then
                 echo "WARNING: this tailnet has no HTTPS certificate domain. Enable MagicDNS and HTTPS certificates in the Tailscale admin console (DNS page), then run: ${TS_RECOVER}" >&2
                 TS_STATE=connected
@@ -934,7 +934,7 @@ process.stdin.on("data", (chunk) => (data += chunk)).on("end", () => {
                 TS_STATE=connected
             fi
         else
-            echo "WARNING: Tailscale login did not complete. Finish it with: tailscale up --hostname=${TS_HOSTNAME} --accept-dns=false --operator=${CT_USER} — then publish with: tailscale serve --bg --https=8443 http://127.0.0.1:6080 (https+insecure:// if EXPOSE_LAN=1); as ${CT_USER}: openclaw config set gateway.tailscale.mode serve && openclaw config set gateway.auth.allowTailscale false; systemctl restart openclaw-gateway" >&2
+            echo "WARNING: Tailscale login did not complete. Finish it with: tailscale up --hostname=${TS_HOSTNAME} --accept-dns=false --operator=${CT_USER} — then publish with: tailscale serve --bg --https=8443 http://127.0.0.1:6080 (https+insecure:// if EXPOSE_LAN=1); as ${CT_USER}: openclaw config set gateway.tailscale.mode serve && openclaw config set gateway.auth.allowTailscale false; sudo systemctl restart openclaw-gateway" >&2
         fi
     fi
 fi
@@ -1236,6 +1236,18 @@ RestartSec=5
 WantedBy=multi-user.target
 SVC
 
+# Let the login user restart (only) the gateway, e.g. after `openclaw config set ...`. This grants
+# nothing it cannot already do (it can signal its own gateway process); no other command is allowed.
+SYSTEMCTL_BIN=$(readlink -f "$(command -v systemctl)")
+cat > /etc/sudoers.d/openclaw-gateway <<SUDOERS
+${CT_USER} ALL=(root) NOPASSWD: ${SYSTEMCTL_BIN} restart openclaw-gateway, ${SYSTEMCTL_BIN} restart openclaw-gateway.service
+SUDOERS
+chmod 440 /etc/sudoers.d/openclaw-gateway
+if ! visudo -cf /etc/sudoers.d/openclaw-gateway >/dev/null; then
+    rm -f /etc/sudoers.d/openclaw-gateway
+    echo "WARNING: could not install the gateway-restart sudo rule (invalid sudoers syntax)" >&2
+fi
+
 systemctl daemon-reload
 systemctl enable openclaw-gateway.service vncserver.service novnc.service >/dev/null 2>&1
 # A service that fails to start is reported by the host's verification step, not fatal here
@@ -1303,6 +1315,7 @@ if [[ "$EXPOSE_LAN" == "1" ]]; then
 else
     check "noVNC answers on 127.0.0.1:6080" "curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html" 10
 fi
+check "${CT_USER} may restart the gateway with sudo" "sudo -l -U ${CT_USER} | grep -q 'restart openclaw-gateway'"
 if [[ "$ENABLE_SUDO" == "1" ]]; then
     check "${CT_USER} is in the sudo group" "id -nG ${CT_USER} | tr ' ' '\n' | grep -qx sudo"
 fi
@@ -1374,7 +1387,7 @@ summary() {
     if [[ "$ENABLE_SUDO" == "1" ]]; then
         kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (sudo needs the password; root shell: pct enter $VMID)"
     else
-        kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (no sudo; root shell: pct enter $VMID)"
+        kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (sudo only for: systemctl restart openclaw-gateway; root shell: pct enter $VMID)"
     fi
     if [[ -n "$GITHUB_KEYS_FILE" ]]; then
         if [[ "$SSH_DISABLE_PASSWORD" != "1" ]]; then

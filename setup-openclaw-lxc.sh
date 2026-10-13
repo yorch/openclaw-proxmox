@@ -10,7 +10,7 @@
 #   CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 CORES=6 ./setup-openclaw-lxc.sh
 # Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME
 #            BRIDGE IP_ADDRESS GATEWAY NAMESERVER SEARCHDOMAIN VLAN_TAG MTU SWAP TIMEZONE
-#            ENABLE_TAILSCALE TS_AUTHKEY TS_HOSTNAME
+#            ENABLE_TAILSCALE TS_AUTHKEY TS_HOSTNAME ENABLE_SUDO
 #            TMPL_STORAGE ROOT_STORAGE ONBOOT PRIVILEGED NODE_MAJOR OPENCLAW_VERSION
 #            HOMEBREW_INSTALL_REF EXPOSE_LAN GITHUB_SSH_USER SSH_DISABLE_PASSWORD
 #
@@ -184,7 +184,7 @@ require_int() { # require_int NAME MIN MAX
 
 if [[ -z "${CT_PASSWORD:-}" ]]; then
     [[ -t 0 ]] || fatal "No terminal available — set CT_PASSWORD in the environment."
-    read -rp "Password for the 'openclaw' user (SSH login): " -s CT_PASSWORD
+    read -rp "Password for the 'openclaw' user (SSH login and sudo): " -s CT_PASSWORD
     echo
     read -rp "Confirm password: " -s CT_PASSWORD_CONFIRM
     echo
@@ -200,6 +200,8 @@ ask CORES     "CPU cores"        4
 ask VNC_RES   "VNC resolution"   1920x1080
 ask EXPOSE_LAN "Expose noVNC on the LAN over HTTPS? 1=yes 0=no (loopback only, use an SSH tunnel)" 0
 ask CT_HOSTNAME "Hostname" openclaw
+# The agent runs as this user, so sudo is opt-in; when on, it always needs the user's password
+ask ENABLE_SUDO "Allow the 'openclaw' user to use sudo (password required)? 1=yes 0=no" 0
 
 # ── Tailscale (optional) ──
 # Providing an auth key implies that you want Tailscale
@@ -301,6 +303,7 @@ fi
 [[ "$ONBOOT" =~ ^[01]$ ]] || fatal "ONBOOT must be 0 or 1."
 [[ "$EXPOSE_LAN" =~ ^[01]$ ]] || fatal "EXPOSE_LAN must be 0 or 1."
 [[ "$ENABLE_TAILSCALE" =~ ^[01]$ ]] || fatal "ENABLE_TAILSCALE must be 0 or 1."
+[[ "$ENABLE_SUDO" =~ ^[01]$ ]] || fatal "ENABLE_SUDO must be 0 or 1."
 [[ "$TS_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fatal "Invalid Tailscale hostname '$TS_HOSTNAME'."
 [[ "$TS_AUTHKEY" != *[[:space:]]* ]] || fatal "The Tailscale auth key must not contain whitespace."
 ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist on this host."
@@ -559,6 +562,7 @@ kv "Remote desktop" "${VNC_RES}, $([[ "$EXPOSE_LAN" == "1" ]] && echo "HTTPS on 
 if [[ "$ENABLE_TAILSCALE" == "1" ]]; then
     kv "Tailscale" "Serve as ${TS_HOSTNAME} · $([[ -n "$TS_AUTHKEY" ]] && echo "auth key" || echo "login link")"
 fi
+kv "Sudo" "$([[ "$ENABLE_SUDO" == "1" ]] && echo "openclaw may use sudo (password required)" || echo "none — root shell via pct enter")"
 kv "Start on boot" "$([[ "$ONBOOT" == "1" ]] && echo yes || echo no)"
 if [[ -n "$GITHUB_KEYS_FILE" ]]; then
     kv "SSH keys" "${#GITHUB_KEY_FPS[@]} from github.com/${GITHUB_SSH_USER} · password login $([[ "$SSH_DISABLE_PASSWORD" == "1" ]] && echo disabled || echo "stays enabled")"
@@ -702,6 +706,7 @@ chmod 700 "$WORKDIR"
     printf 'ENABLE_TAILSCALE=%q\n'    "$ENABLE_TAILSCALE"
     printf 'TS_HOSTNAME=%q\n'         "$TS_HOSTNAME"
     printf 'SSH_DISABLE_PASSWORD=%q\n' "$SSH_DISABLE_PASSWORD"
+    printf 'ENABLE_SUDO=%q\n'         "$ENABLE_SUDO"
 } > "$WORKDIR/provision.env"
 
 cat > "$WORKDIR/provision.sh" <<'PROVISION'
@@ -768,6 +773,10 @@ apt_install curl ca-certificates gnupg git sudo openssh-server
 step "Creating user ${CT_USER}"
 id "$CT_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$CT_USER"
 chpasswd <<<"${CT_USER}:${CT_PASSWORD}"
+if [[ "$ENABLE_SUDO" == "1" ]]; then
+    echo "      allowing ${CT_USER} to use sudo (the password is required)"
+    usermod -aG sudo "$CT_USER"
+fi
 systemctl enable --now ssh >/dev/null 2>&1
 
 # SSH keys fetched from GitHub and validated on the host (optional)
@@ -1294,6 +1303,9 @@ if [[ "$EXPOSE_LAN" == "1" ]]; then
 else
     check "noVNC answers on 127.0.0.1:6080" "curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html" 10
 fi
+if [[ "$ENABLE_SUDO" == "1" ]]; then
+    check "${CT_USER} is in the sudo group" "id -nG ${CT_USER} | tr ' ' '\n' | grep -qx sudo"
+fi
 if [[ -n "$GITHUB_KEYS_FILE" ]]; then
     check "SSH keys from GitHub authorized for ${CT_USER}" "test -s /home/${CT_USER}/.ssh/authorized_keys"
     if [[ "$SSH_DISABLE_PASSWORD" == "1" ]]; then
@@ -1359,7 +1371,11 @@ summary() {
     fi
     echo -e "${DIM}  ${rule}${NC}"
     kv "Container" "$VMID ($CT_HOSTNAME) · $CT_IP"
-    kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (no sudo; root shell: pct enter $VMID)"
+    if [[ "$ENABLE_SUDO" == "1" ]]; then
+        kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (sudo needs the password; root shell: pct enter $VMID)"
+    else
+        kv "SSH login" "ssh ${CT_USER}@${CT_IP}   (no sudo; root shell: pct enter $VMID)"
+    fi
     if [[ -n "$GITHUB_KEYS_FILE" ]]; then
         if [[ "$SSH_DISABLE_PASSWORD" != "1" ]]; then
             kv "" "${DIM}key login with your github.com/${GITHUB_SSH_USER} key(s) (${#GITHUB_KEY_FPS[@]}); password login also enabled${NC}"

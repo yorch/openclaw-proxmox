@@ -73,7 +73,7 @@
           {
             "@type": "Question",
             "name": "Why an unprivileged container and a non-root user?",
-            "acceptedAnswer": { "@type": "Answer", "text": "An AI agent that runs commands and drives a browser should be boxed in. In an unprivileged LXC where everything runs as a regular user with no sudo, a compromised agent or browser does not get root in the container or on the Proxmox host. Chrome keeps its sandbox." }
+            "acceptedAnswer": { "@type": "Answer", "text": "An AI agent that runs commands and drives a browser should be boxed in. In an unprivileged LXC where everything runs as a regular user with no sudo by default, a compromised agent or browser does not get root in the container or on the Proxmox host. Chrome keeps its sandbox." }
           },
           {
             "@type": "Question",
@@ -181,7 +181,7 @@
         <h2>Everything your agent needs, nothing it shouldn't have</h2>
         <p class="sub">OpenClaw runs inside a purpose-built container so you can give it a real desktop and browser without handing it your homelab.</p>
         <div class="grid">
-          <article class="card"><h3>🧱 Contained by design</h3><p>An unprivileged LXC with nesting. Gateway, desktop and Chrome run as a regular <code>openclaw</code> user — never root, and with no sudo.</p></article>
+          <article class="card"><h3>🧱 Contained by design</h3><p>An unprivileged LXC with nesting. Gateway, desktop and Chrome run as a regular <code>openclaw</code> user — never root, and with no sudo by default.</p></article>
           <article class="card"><h3>🔒 Private by default</h3><p>Only SSH is reachable. The dashboard and remote desktop sit on loopback until you choose a tunnel, Tailscale, or HTTPS on your LAN.</p></article>
           <article class="card"><h3>🖥️ A desktop for your agent</h3><p>LXQt, Google Chrome and TigerVNC behind noVNC: open the desktop from any browser and watch your assistant work.</p></article>
           <article class="card"><h3>🌐 Tailscale, optional</h3><p>Publish the dashboard and the desktop over HTTPS on your tailnet with real certificates. Token still required; no Funnel, no public exposure.</p></article>
@@ -261,7 +261,7 @@
             <tbody>
               <tr><th scope="row">Container</th><td>Unprivileged with nesting — a container escape needs more than a root process inside it.</td></tr>
               <tr><th scope="row">Processes</th><td>Gateway, desktop and Chrome run as <code>openclaw</code>, not root. Chrome keeps its sandbox.</td></tr>
-              <tr><th scope="row">Privileges</th><td>No sudo for <code>openclaw</code>. Administer from the host with <code>pct enter</code>.</td></tr>
+              <tr><th scope="row">Privileges</th><td>No sudo for <code>openclaw</code> by default; administer from the host with <code>pct enter</code>. Opt in with <code>ENABLE_SUDO=1</code> and every <code>sudo</code> still needs the user's password.</td></tr>
               <tr><th scope="row">Network</th><td>Only SSH is reachable by default. noVNC and the gateway stay on loopback; with Tailscale they are published on your tailnet only (no Funnel).</td></tr>
               <tr><th scope="row">Authentication</th><td>Dashboard token is always required, even on your tailnet. Optional GitHub SSH keys with fingerprint confirmation and optional key-only login.</td></tr>
               <tr><th scope="row">Secrets</th><td>Passed into the container as private files, never on command lines, and removed afterwards.</td></tr>
@@ -311,7 +311,7 @@ VLAN_TAG=20 GITHUB_SSH_USER=octocat \
         <h2>Frequently asked questions</h2>
         <details><summary>How do I install OpenClaw on Proxmox?</summary><p>Run the one-line command above as root on your Proxmox host. It asks for a password and a handful of options, shows a plan, and creates an unprivileged Debian 13 LXC with OpenClaw, an LXQt desktop, Chrome and noVNC. It typically takes several minutes.</p></details>
         <details><summary>Is OpenClaw exposed to my network or the internet?</summary><p>No. By default only SSH is reachable; the dashboard and remote desktop listen on the container's loopback. Reach them through an SSH tunnel, publish them privately on your tailnet with Tailscale Serve, or serve noVNC over HTTPS on your LAN. Tailscale Funnel (public internet) is intentionally not set up.</p></details>
-        <details><summary>Why an unprivileged container and a non-root user?</summary><p>So that a compromised agent or browser does not get root — in the container or on the Proxmox host. Everything runs as <code>openclaw</code> with no sudo, and Chrome keeps its sandbox.</p></details>
+        <details><summary>Why an unprivileged container and a non-root user?</summary><p>So that a compromised agent or browser does not get root — in the container or on the Proxmox host. Everything runs as <code>openclaw</code> with no sudo by default, and Chrome keeps its sandbox.</p></details>
         <details><summary>Does it work on ARM or a Raspberry Pi?</summary><p>Not yet. Google Chrome is installed from its amd64 package, so the installer stops early on other architectures.</p></details>
         <details><summary>Can I use a static IP, a VLAN or a custom bridge?</summary><p>Yes — pick the bridge from a menu or set <code>BRIDGE</code>, <code>IP_ADDRESS</code>, <code>GATEWAY</code>, <code>NAMESERVER</code>, <code>SEARCHDOMAIN</code>, <code>VLAN_TAG</code> and <code>MTU</code>. Static settings are validated and an address that already answers ping is refused.</p></details>
         <details><summary>How do I log in over SSH with my GitHub key?</summary><p>Enter your GitHub username when asked (or set <code>GITHUB_SSH_USER</code>). The installer downloads <code>github.com/&lt;user&gt;.keys</code> over HTTPS, validates every key, shows fingerprints for you to confirm and authorizes them for <code>openclaw</code>. Set <code>SSH_DISABLE_PASSWORD=1</code> for key-only login — keep a way in with <code>pct enter</code>.</p></details>

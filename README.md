@@ -114,7 +114,7 @@ An example summary (your values will differ):
   ✔ OpenClaw is ready  (finished in 9m 42s)
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Container        105 (openclaw) · 10.1.1.186
-  SSH login        ssh openclaw@10.1.1.186   (no sudo; root shell: pct enter 105)
+  SSH login        ssh openclaw@10.1.1.186   (no sudo; root shell: pct enter 105)   # or "sudo needs the password" with ENABLE_SUDO=1
 
   Remote desktop
   URL              http://localhost:6080/vnc.html
@@ -187,7 +187,8 @@ Interactive prompts cover the essentials; everything below can also be preset as
 
 | Variable | Default | Description |
 |---|---|---|
-| `CT_PASSWORD` | *(required)* | Password of the `openclaw` user (SSH login) |
+| `CT_PASSWORD` | *(required)* | Password of the `openclaw` user (SSH login, and `sudo` when enabled) |
+| `ENABLE_SUDO` | `0` | `1` lets `openclaw` use `sudo` (password required). Off by default because the agent runs as this user |
 | `VMID` | next free | Container ID, checked against existing guests |
 | `CT_HOSTNAME` | `openclaw` | Container hostname |
 | `DISK_SIZE` | `32` | Root disk in GB |
@@ -265,7 +266,7 @@ Static settings are validated (address form, gateway inside the network, DNS ent
 |---|---|
 | Container | **Unprivileged** with nesting; a container escape needs more than a root process inside it |
 | Processes | Gateway, desktop and Chrome run as **`openclaw`**, not root; Chrome keeps its **sandbox** |
-| Privileges | `openclaw` has **no sudo**. Administer with `pct enter <VMID>` from the host |
+| Privileges | `openclaw` has **no sudo** by default; administer with `pct enter <VMID>` from the host. `ENABLE_SUDO=1` adds it to the `sudo` group, and every `sudo` then needs the user's password |
 | Network | Only **SSH** is reachable by default; noVNC and the gateway are on loopback. With Tailscale they are published on your tailnet only (no Funnel) |
 | SSH | Optional **key login** with your GitHub public keys (fetched over HTTPS, validated, fingerprints shown for confirmation); `SSH_DISABLE_PASSWORD=1` makes it key-only |
 | Remote desktop | Optional **HTTPS-only** noVNC (`EXPOSE_LAN=1`) with a generated certificate and a random VNC password |

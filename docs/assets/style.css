@@ -98,6 +98,7 @@ h3 { margin: 0 0 8px; font-size: 1.1rem; }
 .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; box-shadow: var(--shadow); position: relative; }
 .card p { color: var(--muted); margin: 0 0 12px; }
+#features .card h3::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 10px; border-radius: 3px; background: linear-gradient(135deg, #f97316, #ec4899); vertical-align: 1px; }
 .card pre { margin: 0; }
 .tag { display: inline-block; font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; margin-bottom: 10px; }
 .t-hot { color: #fff; border-color: transparent; background: linear-gradient(90deg, #f97316, #ec4899); }

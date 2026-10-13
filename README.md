@@ -313,10 +313,25 @@ Your `pve-container` package is too old for Debian 13. Update the host (`apt upd
 </details>
 
 <details>
-<summary><b>Tailscale did not come up</b></summary>
+<summary><b>Tailscale did not come up, or the page is unreachable</b></summary>
 
-- **Login link timed out:** finish it inside the container: `tailscale up --hostname=<name> --accept-dns=false --operator=openclaw`, then publish noVNC with `tailscale serve --bg --https=8443 http://127.0.0.1:6080` (use `https+insecure://127.0.0.1:6080` if you installed with `EXPOSE_LAN=1`). To have OpenClaw publish the dashboard, run as `openclaw`: `openclaw config set gateway.tailscale.mode serve` and `openclaw config set gateway.auth.allowTailscale false`, then `systemctl restart openclaw-gateway`.
-- **`tailscale serve` failed:** enable HTTPS certificates and Serve for your tailnet in the Tailscale admin console (DNS / settings), then re-run the command above.
+First see what is published, inside the container: `tailscale serve status`. A working install lists both `:443` (the dashboard) and `:8443` (the remote desktop). "No serve config" means nothing is published yet.
+
+**Publishing by hand** (inside the container; `openclaw` is the Tailscale operator, so no root is needed):
+
+1. Log in if needed: `tailscale up --hostname=<name> --accept-dns=false --operator=openclaw`.
+2. Publish noVNC. **The target depends on how you installed:**
+   - default install (loopback): `tailscale serve --bg --https=8443 http://127.0.0.1:6080`
+   - installed with `EXPOSE_LAN=1`: `tailscale serve --bg --https=8443 https+insecure://127.0.0.1:6080` (noVNC then speaks HTTPS only; `https+insecure` makes Tailscale accept its self-signed certificate on loopback).
+3. Let OpenClaw publish the dashboard: `openclaw config set gateway.tailscale.mode serve` and `openclaw config set gateway.auth.allowTailscale false`, then `sudo systemctl restart openclaw-gateway` (or `pct exec <VMID> -- systemctl restart openclaw-gateway` from the host).
+
+**Symptoms**
+
+- **HTTP 502 on `:8443`:** Tailscale reached the node but not the backend. You used the wrong noVNC target in step 2. Test inside the container: `curl -sI http://127.0.0.1:6080/vnc.html` (works on a default install) versus `curl -skI https://127.0.0.1:6080/vnc.html` (works with `EXPOSE_LAN=1`), then publish the one that answers.
+- **"No serve config", or `gateway.tailscale.mode` unset:** the installer skipped publishing, usually because the tailnet has no HTTPS certificates. Enable **MagicDNS** and **HTTPS Certificates** on the DNS page of the Tailscale admin console, then follow the steps above. Check with `tailscale status --json | grep -A4 CertDomains`.
+- **`tailscale serve` prints a link and waits:** Serve is not enabled for your tailnet. Open the link, enable it, and the command completes.
+- **Dashboard (`:443`) missing but `:8443` works:** OpenClaw publishes it itself once the gateway runs in serve mode. Check `openclaw config get gateway.tailscale.mode` and `journalctl -u openclaw-gateway -n 40` (the gateway will not start while the node's Tailscale key is expired).
+- **Browser says "pairing required":** approve it from the container with `openclaw devices list`, then `openclaw devices approve <requestId>`.
 - **Userspace mode:** check `pct config <VMID>` for a `dev0: /dev/net/tun` line. Without it the installer uses userspace networking (publishing works; outbound tailnet connections don't).
 
 </details>

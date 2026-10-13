@@ -39,6 +39,7 @@ Key helpers: `ct_exec()` wraps `pct exec $VMID -- bash -c` for small host-driven
 - `/etc/sudoers.d/openclaw-gateway` (always installed, validated with `visudo -cf`) lets `openclaw` run only `systemctl restart openclaw-gateway` without a password. Keep it that narrow.
 - `ENABLE_SUDO=1` (opt-in, default 0) adds `openclaw` to the `sudo` group; Debian's stock rule requires the user's password. Never add NOPASSWD: the agent runs as this user.
 - noVNC auto-scaling is set with `/usr/share/novnc/defaults.json` (dpkg-diverted so upgrades keep it), not by patching `ui.js`.
+- `htop jq ncdu mtr-tiny` are always installed; `EXTRA_PACKAGES` (env only, validated against a package-name regex, passed via the env file) adds more with an unquoted `apt_install`. Keep the default set small.
 - Auth token: `openssl rand -hex 16`; VNC password: random 8 alphanumerics (VNC truncates at 8).
 - Use Conventional Commits.
 

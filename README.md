@@ -189,6 +189,7 @@ Interactive prompts cover the essentials; everything below can also be preset as
 |---|---|---|
 | `CT_PASSWORD` | *(required)* | Password of the `openclaw` user (SSH login, and `sudo` when enabled) |
 | `ENABLE_SUDO` | `0` | `1` lets `openclaw` use `sudo` (password required). Off by default because the agent runs as this user |
+| `EXTRA_PACKAGES` | *(empty)* | Space-separated extra apt packages to install, e.g. `'btop tig sysstat'`. `htop`, `jq`, `ncdu` and `mtr-tiny` are always installed |
 | `VMID` | next free | Container ID, checked against existing guests |
 | `CT_HOSTNAME` | `openclaw` | Container hostname |
 | `DISK_SIZE` | `32` | Root disk in GB |
@@ -258,7 +259,7 @@ Static settings are validated (address form, gateway inside the network, DNS ent
 
 **Command line:** `-y` / `--yes` skips the confirmation, `-h` / `--help` prints usage. Set `NO_COLOR=1` to disable colors.
 
-**What gets installed** (all inside the container, nothing on the Proxmox host): Node.js from the signed NodeSource apt repository, OpenClaw, Homebrew (for OpenClaw skills), LXQt, TigerVNC, noVNC, Google Chrome, OpenSSH, and the Noto Color Emoji font.
+**What gets installed** (all inside the container, nothing on the Proxmox host): Node.js from the signed NodeSource apt repository, OpenClaw, Homebrew (for OpenClaw skills), LXQt, TigerVNC, noVNC, Google Chrome, OpenSSH, the Noto Color Emoji font, and a small diagnostics toolbox (`htop`, `jq`, `ncdu`, `mtr-tiny`). Add more with `EXTRA_PACKAGES`.
 
 ## 🔒 Security model
 

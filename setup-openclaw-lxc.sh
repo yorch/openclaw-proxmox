@@ -10,7 +10,7 @@
 #   CT_PASSWORD='s3cret' DISK_SIZE=64 MEMORY=8192 CORES=6 ./setup-openclaw-lxc.sh
 # Supported: CT_PASSWORD DISK_SIZE MEMORY CORES VNC_RES VMID CT_HOSTNAME
 #            BRIDGE IP_ADDRESS GATEWAY NAMESERVER SEARCHDOMAIN VLAN_TAG MTU SWAP TIMEZONE
-#            ENABLE_TAILSCALE TS_AUTHKEY TS_HOSTNAME ENABLE_SUDO
+#            ENABLE_TAILSCALE TS_AUTHKEY TS_HOSTNAME ENABLE_SUDO EXTRA_PACKAGES
 #            TMPL_STORAGE ROOT_STORAGE ONBOOT PRIVILEGED NODE_MAJOR OPENCLAW_VERSION
 #            HOMEBREW_INSTALL_REF EXPOSE_LAN GITHUB_SSH_USER SSH_DISABLE_PASSWORD
 #
@@ -304,6 +304,10 @@ fi
 [[ "$EXPOSE_LAN" =~ ^[01]$ ]] || fatal "EXPOSE_LAN must be 0 or 1."
 [[ "$ENABLE_TAILSCALE" =~ ^[01]$ ]] || fatal "ENABLE_TAILSCALE must be 0 or 1."
 [[ "$ENABLE_SUDO" =~ ^[01]$ ]] || fatal "ENABLE_SUDO must be 0 or 1."
+# Extra apt packages (env only): space-separated Debian package names
+EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
+[[ -z "$EXTRA_PACKAGES" || "$EXTRA_PACKAGES" =~ ^[a-z0-9][a-z0-9+.:-]*([[:space:]]+[a-z0-9][a-z0-9+.:-]*)*$ ]] \
+    || fatal "EXTRA_PACKAGES must be space-separated Debian package names (e.g. 'btop tig sysstat')."
 [[ "$TS_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || fatal "Invalid Tailscale hostname '$TS_HOSTNAME'."
 [[ "$TS_AUTHKEY" != *[[:space:]]* ]] || fatal "The Tailscale auth key must not contain whitespace."
 ip link show "$BRIDGE" >/dev/null 2>&1 || fatal "Bridge '$BRIDGE' does not exist on this host."
@@ -707,6 +711,7 @@ chmod 700 "$WORKDIR"
     printf 'TS_HOSTNAME=%q\n'         "$TS_HOSTNAME"
     printf 'SSH_DISABLE_PASSWORD=%q\n' "$SSH_DISABLE_PASSWORD"
     printf 'ENABLE_SUDO=%q\n'         "$ENABLE_SUDO"
+    printf 'EXTRA_PACKAGES=%q\n'     "$EXTRA_PACKAGES"
 } > "$WORKDIR/provision.env"
 
 cat > "$WORKDIR/provision.sh" <<'PROVISION'
@@ -768,6 +773,13 @@ update-locale LANG="$CT_LOCALE"
 export LANG="$CT_LOCALE" LC_ALL="$CT_LOCALE"
 quiet apt-get upgrade -y "${APT_OPTS[@]}"
 apt_install curl ca-certificates gnupg git sudo openssh-server
+# Small diagnostics toolbox; EXTRA_PACKAGES adds more (word splitting is intended)
+apt_install htop jq ncdu mtr-tiny
+if [[ -n "$EXTRA_PACKAGES" ]]; then
+    echo "      extra packages: ${EXTRA_PACKAGES}"
+    # shellcheck disable=SC2086
+    apt_install $EXTRA_PACKAGES
+fi
 
 # ── Unprivileged login user (runs the desktop, Chrome and the gateway) ───────
 step "Creating user ${CT_USER}"

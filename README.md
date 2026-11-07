@@ -382,7 +382,7 @@ The gateway already runs as a system service, so the wizard shortcut starts `ope
 
 ## 🤝 Contributing
 
-Issues and pull requests are welcome. The project is a single Bash script; [CLAUDE.md](CLAUDE.md) explains its architecture and conventions.
+Issues and pull requests are welcome. The project is a single Bash script; [AGENTS.md](AGENTS.md) explains its architecture and conventions.
 
 - Run `shellcheck setup-openclaw-lxc.sh` and `bash -n setup-openclaw-lxc.sh` before opening a PR; CI also lints the embedded in-container script.
 - There is no automated test suite — try changes on a Proxmox host.
